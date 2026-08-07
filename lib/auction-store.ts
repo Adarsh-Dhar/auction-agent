@@ -16,6 +16,7 @@ export type Auction = {
   channels: string[]
   autoExtend: boolean
   requiresApproval: boolean
+  joinCode: string
 }
 
 export type Bidder = { id: string; name: string; handle: string; status: "active" | "quiet" | "dropped"; lastBid: string; connection: string }
@@ -25,10 +26,25 @@ export type Settlement = { id: string; auctionId: string; winner: string; amount
 
 const now = () => new Date().toISOString()
 const events = new EventEmitter()
+
+// Room-code style join codes (like Ludo King): short, unambiguous, easy to read aloud.
+// Excludes visually-confusable characters (0/O, 1/I/L).
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+function generateJoinCode(length = 6): string {
+  let code = ""
+  for (let i = 0; i < length; i++) code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]
+  return code
+}
+function generateUniqueJoinCode(): string {
+  let code = generateJoinCode()
+  while (auctions.some((auction) => auction.joinCode === code)) code = generateJoinCode()
+  return code
+}
+
 const auctions: Auction[] = [
-  { id: "AUC-1048", title: "Signed first-edition design book", status: "live", bidders: 7, topBid: "$2,450", floor: "$1,800", endsAt: "2026-08-09T18:30:00.000Z", createdAt: now(), terms: "Winner pays within 48 hours. Shipping included.", channels: ["Web chat", "Email"], autoExtend: true, requiresApproval: true },
-  { id: "AUC-1047", title: "Studio portrait commission", status: "live", bidders: 4, topBid: "$980", floor: "$750", endsAt: "2026-08-10T13:00:00.000Z", createdAt: now(), terms: "Final deliverables due within 30 days.", channels: ["Web chat"], autoExtend: false, requiresApproval: false },
-  { id: "AUC-1046", title: "Rare analog synthesizer", status: "draft", bidders: 0, topBid: "$0", floor: "$1,200", endsAt: "2026-08-14T20:00:00.000Z", createdAt: now(), terms: "Local pickup preferred.", channels: ["Web chat", "SMS"], autoExtend: true, requiresApproval: true },
+  { id: "AUC-1048", title: "Signed first-edition design book", status: "live", bidders: 7, topBid: "$2,450", floor: "$1,800", endsAt: "2026-08-09T18:30:00.000Z", createdAt: now(), terms: "Winner pays within 48 hours. Shipping included.", channels: ["Web chat", "Email"], autoExtend: true, requiresApproval: true, joinCode: "K7P2QX" },
+  { id: "AUC-1047", title: "Studio portrait commission", status: "live", bidders: 4, topBid: "$980", floor: "$750", endsAt: "2026-08-10T13:00:00.000Z", createdAt: now(), terms: "Final deliverables due within 30 days.", channels: ["Web chat"], autoExtend: false, requiresApproval: false, joinCode: "R9TZ4M" },
+  { id: "AUC-1046", title: "Rare analog synthesizer", status: "draft", bidders: 0, topBid: "$0", floor: "$1,200", endsAt: "2026-08-14T20:00:00.000Z", createdAt: now(), terms: "Local pickup preferred.", channels: ["Web chat", "SMS"], autoExtend: true, requiresApproval: true, joinCode: "8HD3WY" },
 ]
 const bidders: Record<string, Bidder[]> = { "AUC-1048": [
   { id: "bd-1", name: "Maya Chen", handle: "maya.chen", status: "active", lastBid: "$2,450", connection: "Web chat" },
@@ -47,7 +63,38 @@ const settings = { reserveProtection: true, autoExtend: true, humanApproval: fal
 
 export const auctionStore = { auctions, bidders, messages, escalations, settlements, settings, events }
 export function emit(type: string, payload: unknown) { events.emit("auction", { type, payload, at: now() }) }
-export function createAuction(input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid">) { const auction: Auction = { ...input, id: `AUC-${1049 + auctions.length}`, createdAt: now(), bidders: 0, topBid: "$0" }; auctions.unshift(auction); emit("auction.created", auction); return auction }
+export function createAuction(input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode">) { const auction: Auction = { ...input, id: `AUC-${1049 + auctions.length}`, createdAt: now(), bidders: 0, topBid: "$0", joinCode: generateUniqueJoinCode() }; auctions.unshift(auction); bidders[auction.id] = []; emit("auction.created", auction); return auction }
+
+// Regenerates the join code for an auction, e.g. if the seller thinks it leaked.
+export function rotateJoinCode(auctionId: string) { const auction = auctions.find((entry) => entry.id === auctionId); if (auction) { auction.joinCode = generateUniqueJoinCode(); emit("auction.codeRotated", auction) }; return auction }
+
+// Parses a chat-style join command, e.g. "/join K7P2QX" or "join k7p2qx".
+// Returns the extracted code (uppercased) or null if the message isn't a join command.
+export function parseJoinCommand(message: string): string | null {
+  const match = message.trim().match(/^\/?join\s+([a-z0-9]{4,8})$/i)
+  return match ? match[1].toUpperCase() : null
+}
+
+export type JoinResult =
+  | { ok: true; auction: Auction; bidder: Bidder }
+  | { ok: false; reason: "invalid_code" | "auction_closed" }
+
+// A bidder joins an auction by presenting the room code the seller shared with them.
+// This is the gate that stops anyone who doesn't have the code from being added.
+export function joinAuctionByCode(code: string, applicant: { name: string; handle: string; connection: string }): JoinResult {
+  const normalized = code.trim().toUpperCase()
+  const auction = auctions.find((entry) => entry.joinCode === normalized)
+  if (!auction) return { ok: false, reason: "invalid_code" }
+  if (auction.status === "closed") return { ok: false, reason: "auction_closed" }
+  const roster = bidders[auction.id] || (bidders[auction.id] = [])
+  const existing = roster.find((entry) => entry.handle.toLowerCase() === applicant.handle.toLowerCase())
+  if (existing) return { ok: true, auction, bidder: existing }
+  const bidder: Bidder = { id: `bd-${Date.now().toString(36)}`, name: applicant.name, handle: applicant.handle, status: "active", lastBid: "—", connection: applicant.connection }
+  roster.push(bidder)
+  auction.bidders = roster.length
+  emit("bidder.joined", { auctionId: auction.id, bidder })
+  return { ok: true, auction, bidder }
+}
 export function resolveEscalation(id: string) { const item = escalations.find((entry) => entry.id === id); if (item) { item.status = "resolved"; emit("escalation.resolved", item) }; return item }
 export function addMessage(bidderId: string, body: string) { const message: Message = { id: `m-${Date.now()}`, bidderId, author: "Operator", body, kind: "system", at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }; messages[bidderId] = [...(messages[bidderId] || []), message]; emit("message.created", message); return message }
 export function createSettlement(input: Pick<Settlement, "winner" | "amount" | "asset" | "wallet" | "auctionId">) { const settlement: Settlement = { ...input, id: `set-${Date.now()}`, signature: "awaiting-wallet-signature", status: "pending", network: "Solana devnet", paymentRequest: `solana:${input.wallet}?amount=${input.amount}&label=Auction%20settlement`, verification: { wallet: "pending", amount: "pending", confirmations: 0 }, updatedAt: now() }; settlements.unshift(settlement); emit("settlement.created", settlement); return settlement }
