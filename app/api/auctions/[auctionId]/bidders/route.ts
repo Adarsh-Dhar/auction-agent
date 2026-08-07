@@ -1,0 +1,6 @@
+import { NextResponse } from "next/server"
+import { auctionStore, emit, findAuction } from "@/lib/auction-store"
+import { apiError, readJson } from "@/lib/api-utils"
+type Context = { params: Promise<{ auctionId: string }> }
+export async function GET(_: Request, { params }: Context) { const { auctionId } = await params; if (!findAuction(auctionId)) return apiError("Auction not found", 404); return NextResponse.json(auctionStore.bidders[auctionId] || []) }
+export async function POST(request: Request, { params }: Context) { const { auctionId } = await params; if (!findAuction(auctionId)) return apiError("Auction not found", 404); const body = await readJson<Record<string, unknown>>(request); if (!body || typeof body.name !== "string") return apiError("name is required"); const bidder = { id: `bd-${Date.now()}`, auctionId, name: body.name, handle: String(body.handle || body.name.toLowerCase().replace(/\\s+/g, "-")), status: "active" as const, lastBid: "$0", connection: String(body.channel || "web"), lastActiveAt: new Date().toISOString(), paused: false, flagged: false }; auctionStore.bidders[auctionId] = [...(auctionStore.bidders[auctionId] || []), bidder]; const auction = findAuction(auctionId)!; auction.bidders += 1; emit("bidder.joined", bidder, auctionId); return NextResponse.json(bidder, { status: 201 }) }

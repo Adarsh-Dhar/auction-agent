@@ -1,16 +1,6 @@
 import { NextResponse } from "next/server"
 import { getSettlement, updateSettlement } from "@/lib/auction-store"
-
-export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
-  const settlement = getSettlement((await params).id)
-  return settlement ? NextResponse.json(settlement) : NextResponse.json({ error: "Not found" }, { status: 404 })
-}
-
-export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const id = (await params).id
-  const body = await request.json().catch(() => ({}))
-  const status = body.action === "verify" ? "verifying" : body.action === "confirm" ? "confirmed" : body.action === "retry" ? "pending" : undefined
-  if (!status) return NextResponse.json({ error: "Unknown settlement action" }, { status: 400 })
-  const settlement = updateSettlement(id, status)
-  return settlement ? NextResponse.json(settlement) : NextResponse.json({ error: "Not found" }, { status: 404 })
-}
+import { apiError, readJson } from "@/lib/api-utils"
+type Context = { params: Promise<{ id: string }> }
+export async function GET(_: Request, { params }: Context) { const settlement = getSettlement((await params).id); return settlement ? NextResponse.json(settlement) : apiError("Settlement not found", 404) }
+export async function POST(request: Request, { params }: Context) { const id = (await params).id; const body = await readJson<Record<string, unknown>>(request); const settlement = getSettlement(id); if (!settlement) return apiError("Settlement not found", 404); if (!["verify", "confirm", "retry"].includes(String(body?.action))) return apiError("Unknown settlement action"); if (body?.action === "confirm" && settlement.status !== "verifying") return apiError("Settlement must pass verification before confirmation", 409); const status = body?.action === "verify" ? "verifying" : body?.action === "confirm" ? "confirmed" : "pending"; return NextResponse.json(updateSettlement(id, status)!) }

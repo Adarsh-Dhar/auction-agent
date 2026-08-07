@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { auctionStore, createSettlement, updateSettlement } from "@/lib/auction-store"
-export function GET() { return NextResponse.json(auctionStore.settlements) }
-export async function POST(request: Request) { const body = await request.json(); return NextResponse.json(createSettlement(body), { status: 201 }) }
-export async function PATCH(request: Request) { const body = await request.json(); const item = updateSettlement(body.id, body.status); return item ? NextResponse.json(item) : NextResponse.json({ error: "Not found" }, { status: 404 }) }
+import { auctionStore, createSettlement } from "@/lib/auction-store"
+import { apiError, numericValue, readJson } from "@/lib/api-utils"
+export function GET(request: Request) { const { searchParams } = new URL(request.url); return NextResponse.json(auctionStore.settlements.filter((item) => (!searchParams.get("status") || item.status === searchParams.get("status")) && (!searchParams.get("auctionId") || item.auctionId === searchParams.get("auctionId")))) }
+export async function POST(request: Request) { const body = await readJson<Record<string, unknown>>(request); if (!body || typeof body.auctionId !== "string" || typeof body.winner !== "string" || typeof body.wallet !== "string" || numericValue(body.amount) === null) return apiError("auctionId, winner, amount, and wallet are required"); return NextResponse.json(createSettlement({ auctionId: body.auctionId, winner: body.winner, amount: String(body.amount), asset: body.asset === "USDC" ? "USDC" : "SOL", wallet: body.wallet }), { status: 201 }) }
