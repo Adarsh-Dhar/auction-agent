@@ -6,6 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "agent": "tsx scripts/agent-worker.ts",
+    "agent:watch": "tsx watch scripts/agent-worker.ts",
     "lint": "eslint ."
   },
   "dependencies": {
@@ -28,6 +30,7 @@
     "@types/react-dom": "^19",
     "postcss": "^8.5",
     "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.9",
     "typescript": "5.7.3"
   },
   "pnpm": {
