@@ -32,8 +32,11 @@ export type CaspianMessage = { conversationId?: string; connectionId?: string; c
 
 export function isCaspianConfigured() { return Boolean(apiKey) }
 export async function listLiveChannels() { const result = await request<{ channels?: CaspianChannel[] } | CaspianChannel[]>("/v1/channels"); return Array.isArray(result) ? result : result.channels || [] }
-export async function connectEmail(username = "auction-agent") { return request<{ type: string; connected: boolean; address: string; connectionId: string }>("/v1/channels/email/connect", { method: "POST", body: JSON.stringify({ username }) }) }
-export async function testEmail(connectionId?: string) { return request<{ delivered: boolean; messageId?: string }>("/v1/channels/email/test", { method: "POST", body: JSON.stringify({ connectionId }) }) }
+type CaspianResource = { id: string; name: string }
+export async function createCustomer(name: string) { return request<CaspianResource>("/v1/customers", { method: "POST", body: JSON.stringify({ name }) }) }
+export async function createAgent(name: string) { return request<CaspianResource>("/v1/agents", { method: "POST", body: JSON.stringify({ name }) }) }
+export async function connectEmail(username = "auction-agent") { const [customer, agent] = await Promise.all([createCustomer("Auction Agent Customer"), createAgent("Auction Agent")]); return request<{ id: string; channel: string; status: string; address?: string; customer_id: string; agent_id: string }>("/v1/connections/email", { method: "POST", body: JSON.stringify({ customer_id: customer.id, agent_id: agent.id, display_name: "Auction Agent", username, capabilities: ["receive", "reply", "send"] }) }) }
+export async function testEmail(connectionId?: string) { return { delivered: false, connectionId, note: "Connection is active. Send a real inbound email to verify delivery." } }
 export async function sendMessage(message: CaspianMessage) { return request<{ delivered: boolean; messageId?: string }>("/v1/messages", { method: "POST", body: JSON.stringify(message) }) }
 export async function listenForMessages(signal?: AbortSignal) {
   if (!apiKey) throw new CaspianError("Caspian is not configured. Set CASPIAN_API_KEY to run the worker.", 503, "missing_api_key")

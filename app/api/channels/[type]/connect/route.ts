@@ -9,9 +9,9 @@ export async function POST(request: Request, { params }: Context) {
   const body = await readJson<Record<string, unknown>>(request)
   try {
     const connection = await connectEmail(typeof body?.username === "string" ? body.username : "auction-agent")
-    auctionStore.channels.email = { type, connected: true, lastMessageReceived: undefined }
+    auctionStore.channels.email = { type, connected: true, lastMessageReceived: undefined, connectionId: connection.id }
     emit("channel.connected", connection)
-    return NextResponse.json({ ...connection, type, connected: true }, { status: 201 })
+    return NextResponse.json({ ...connection, type, connected: true, connectionId: connection.id }, { status: 201 })
   } catch (error) {
     if (error instanceof CaspianError) return NextResponse.json({ error: error.message, code: error.code, details: error.details }, { status: error.status })
     return apiError("Unable to connect email")

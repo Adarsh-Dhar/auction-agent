@@ -25,7 +25,7 @@ const settlements: Settlement[] = [{ id: "set-1", auctionId: "AUC-1045", winner:
 const policies: Record<string, Policy> = {}
 const audit: AuditEvent[] = []
 const settings = { reserveProtection: true, autoExtend: true, humanApproval: false, webChat: true, email: true, sms: false, defaultEscalationSensitivity: "med" as const }
-const channels: Record<string, { type: string; connected: boolean; lastMessageReceived?: string; authError?: string }> = {}
+const channels: Record<string, { type: string; connected: boolean; lastMessageReceived?: string; authError?: string; connectionId?: string }> = {}
 
 export const auctionStore = { auctions, bidders, messages, escalations, settlements, settings, policies, audit, channels, events }
 export function emit(type: string, payload: unknown, auctionId?: string) { const event = { type, payload, at: now() }; events.emit("auction", event); if (auctionId) audit.unshift({ id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, auctionId, type, payload, at: event.at }); return event }
