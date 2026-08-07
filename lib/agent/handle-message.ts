@@ -7,7 +7,7 @@ export async function handleInboundMessage(input: CaspianMessage) {
   const text = input.body.trim()
   let bidder = input.conversationId ? findBidderByConversation(input.conversationId) : undefined
   const auction = bidder?.auctionId ? auctionStore.auctions.find((entry) => entry.id === bidder?.auctionId) : findAuctionByCode(text)
-  if (!bidder && auction && input.conversationId) bidder = createBidder(auction.id, { name: input.from || "Email bidder", handle: input.from || "email", caspianConversationId: input.conversationId, caspianConnectionId: input.connectionId, caspianChannel: input.channel || "email" })
+  if (!bidder && auction) bidder = createBidder(auction.id, { name: input.from || "Email bidder", handle: input.from || "email", caspianConversationId: input.conversationId, caspianConnectionId: input.connectionId, caspianChannel: input.channel || "email" })
   if (!bidder) return { handled: false, reason: "auction_or_bidder_not_found" }
   const result = classifyMessage(text)
   addMessage(bidder.id, text, { author: bidder.name, kind: result.kind, classification: result.kind, decision: result.decision, amount: result.amountCents ? formatCents(result.amountCents) : undefined, condition: result.condition })

@@ -7,7 +7,7 @@ export function GET(request: Request) {
   const status = searchParams.get("status")
   const sort = searchParams.get("sort")
   if (status && !["live", "draft", "closed", "paused", "settled"].includes(status)) return apiError("Invalid status filter")
-  const items = auctionStore.auctions.filter((auction) => !status || auction.status === status).map(({ id, title, status, floor, topBid, bidders, endsAt }) => ({ id, title, status, floor, topBid, bidderCount: bidders, bidders, endsAt }))
+  const items = auctionStore.auctions.filter((auction) => !status || auction.status === status).map(({ id, title, status, floor, topBid, bidders, endsAt, channels }) => ({ id, title, status, floor, topBid, bidderCount: bidders, bidders, endsAt, channels }))
   if (sort === "ending") items.sort((a, b) => a.endsAt.localeCompare(b.endsAt))
   if (sort === "topBid") items.sort((a, b) => numericValue(b.topBid)! - numericValue(a.topBid)!)
   return NextResponse.json(items)
