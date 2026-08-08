@@ -47,10 +47,12 @@ describe("GET /api/events", () => {
   })
 
   it("is populated by emit() calls when mutations happen", async () => {
-    await createTestAuction()
+    const auction = await createTestAuction({ id: "AUC-TEST", joinCode: "EVTTST" })
+    const { createTestBidder } = await import("@/tests/helpers")
+    const bidder = await createTestBidder(auction.id, { id: "bd-evt-1", name: "Test Bidder" })
     // Trigger a real mutation that calls emit() → logEvent()
     const { createEscalation } = await import("@/lib/auction-store")
-    await createEscalation({ auctionId: "AUC-TEST", bidder: "Test", reason: "Test reason", severity: "low" })
+    await createEscalation({ auctionId: auction.id, bidderId: bidder.id, bidderName: bidder.name, reason: "Test reason", severity: "low" })
 
     // Wait briefly for the fire-and-forget logEvent to complete
     await new Promise((r) => setTimeout(r, 100))

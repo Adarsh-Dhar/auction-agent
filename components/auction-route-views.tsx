@@ -57,7 +57,78 @@ export function JoinView() {
   </AuctionShell>
 }
 
-export function EscalationsView() { const [items, setItems] = useState<Escalation[]>([]); const [filter, setFilter] = useState("all"); useEffect(() => { fetch("/api/escalations").then((r) => r.json()).then(setItems) }, []); const update = async (item: Escalation) => { const status = item.status === "open" ? "resolved" : "open"; const response = await fetch(`/api/escalations/${item.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); const updated = await response.json(); setItems((rows) => rows.map((row) => row.id === updated.id ? updated : row)) }; const visible = items.filter((item) => filter === "all" || item.status === filter || item.severity === filter); return <AuctionShell title="Escalations" eyebrow="Operator review"><div className="toolbar"><div className="segmented-control">{["all", "open", "resolved", "high"].map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value}</button>)}</div><span className="eyebrow">{visible.length} visible</span></div><div className="list-panel">{visible.map((item) => <div className="list-row" key={item.id}><div><span className={badgeClass(item.severity)}>{item.severity}</span><h3>{item.reason}</h3><p>{item.bidder} · {item.auctionId} · {item.status}</p></div><button className="secondary-button" onClick={() => update(item)}>{item.status === "open" ? "Resolve" : "Reopen"}</button></div>)}</div></AuctionShell> }
+export function EscalationsView() {
+  const [items, setItems] = useState<Escalation[]>([])
+  const [filter, setFilter] = useState("all")
+  // Per-item note text, keyed by escalation id
+  const [noteMap, setNoteMap] = useState<Record<string, string>>({})
+
+  useEffect(() => {
+    fetch("/api/escalations").then((r) => r.json()).then(setItems)
+  }, [])
+
+  const update = async (item: Escalation) => {
+    const status = item.status === "open" ? "resolved" : "open"
+    const note = status === "resolved" ? (noteMap[item.id] ?? "") : undefined
+    const response = await fetch(`/api/escalations/${item.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, ...(note !== undefined ? { note } : {}) }),
+    })
+    const updated = await response.json()
+    setItems((rows) => rows.map((row) => row.id === updated.id ? updated : row))
+    // Clear the note after resolving
+    if (status === "resolved") {
+      setNoteMap((prev) => { const next = { ...prev }; delete next[item.id]; return next })
+    }
+  }
+
+  const visible = items.filter(
+    (item) => filter === "all" || item.status === filter || item.severity === filter
+  )
+
+  return (
+    <AuctionShell title="Escalations" eyebrow="Operator review">
+      <div className="toolbar">
+        <div className="segmented-control">
+          {["all", "open", "resolved", "high"].map((value) => (
+            <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>
+              {value}
+            </button>
+          ))}
+        </div>
+        <span className="eyebrow">{visible.length} visible</span>
+      </div>
+      <div className="list-panel">
+        {visible.map((item) => (
+          <div className="list-row" key={item.id}>
+            <div>
+              <span className={badgeClass(item.severity)}>{item.severity}</span>
+              <h3>{item.reason}</h3>
+              <p>{item.bidderName} · {item.auctionId} · {item.status}</p>
+            </div>
+            <div className="escalation-resolve-group">
+              {item.status === "open" && (
+                <textarea
+                  className="escalation-note-input"
+                  placeholder="Message to bidder on resolution (optional)"
+                  rows={2}
+                  value={noteMap[item.id] ?? ""}
+                  onChange={(e) =>
+                    setNoteMap((prev) => ({ ...prev, [item.id]: e.target.value }))
+                  }
+                />
+              )}
+              <button className="secondary-button" onClick={() => update(item)}>
+                {item.status === "open" ? "Resolve" : "Reopen"}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </AuctionShell>
+  )
+}
 export function SettlementsView() {
   const [items, setItems] = useState<Settlement[]>([])
   const [selected, setSelected] = useState<Settlement | null>(null)

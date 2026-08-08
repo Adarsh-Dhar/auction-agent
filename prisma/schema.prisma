@@ -38,8 +38,9 @@ model Bidder {
   connection String   @default("Web chat")
   email      String?
 
-  auction   Auction    @relation(fields: [auctionId], references: [id])
-  messages  Message[]
+  auction      Auction      @relation(fields: [auctionId], references: [id])
+  messages     Message[]
+  escalations  Escalation[]
 }
 
 model Message {
@@ -54,15 +55,17 @@ model Message {
 }
 
 model Escalation {
-  id        String  @id
-  auctionId String
-  bidder    String
-  reason    String
-  severity  String  @default("medium")
-  status    String  @default("open")
-  createdAt String
+  id          String  @id
+  auctionId   String
+  bidderId    String
+  bidderName  String  // display name — denormalised copy of Bidder.name at creation time
+  reason      String
+  severity    String  @default("medium")
+  status      String  @default("open")
+  createdAt   String
 
   auction   Auction @relation(fields: [auctionId], references: [id])
+  bidder    Bidder  @relation(fields: [bidderId], references: [id])
 }
 
 model Settlement {

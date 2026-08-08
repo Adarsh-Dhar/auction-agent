@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { placeBid, getAuction, getMessages, createEscalation } from "@/lib/auction-store"
+import { placeBid, getAuction, getMessages, createEscalation, findBidderById } from "@/lib/auction-store"
 import { classifyMessage } from "@/lib/agent/classify"
 
 const REASON_MESSAGES: Record<string, string> = {
@@ -41,9 +41,11 @@ export async function POST(
 
     // Low-confidence or explicit escalation → create escalation, don't place bid
     if (classification.decision === "escalate" || classification.confidence < 0.55) {
+      const bidder = await findBidderById(body.bidderId)
       const escalation = await createEscalation({
         auctionId,
-        bidder: body.bidderId,
+        bidderId: body.bidderId,
+        bidderName: bidder?.name ?? body.bidderId,
         reason: `Ambiguous message — "${body.rawMessage.slice(0, 80)}" (confidence ${(classification.confidence * 100).toFixed(0)}%)`,
         severity: classification.confidence < 0.4 ? "high" : "medium",
       })

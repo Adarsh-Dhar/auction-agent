@@ -54,8 +54,8 @@ async function main() {
   // ── Escalations ───────────────────────────────────────────────────────────
   await prisma.escalation.createMany({
     data: [
-      { id: "esc-1", auctionId: "AUC-1048", bidder: "Rae Okafor", reason: "Bidder requested a reserve exception", severity: "high", status: "open", createdAt: now() },
-      { id: "esc-2", auctionId: "AUC-1047", bidder: "Jon Bell", reason: "Identity verification pending", severity: "medium", status: "open", createdAt: now() },
+      { id: "esc-1", auctionId: "AUC-1048", bidderId: "bd-3", bidderName: "Rae Okafor", reason: "Bidder requested a reserve exception", severity: "high", status: "open", createdAt: now() },
+      { id: "esc-2", auctionId: "AUC-1048", bidderId: "bd-2", bidderName: "Jon Bell", reason: "Identity verification pending", severity: "medium", status: "open", createdAt: now() },
     ],
   })
 

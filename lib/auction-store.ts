@@ -62,7 +62,10 @@ export type Message = {
 export type Escalation = {
   id: string
   auctionId: string
-  bidder: string
+  /** Real FK to Bidder.id */
+  bidderId: string
+  /** Denormalised display name — copy of Bidder.name at creation time */
+  bidderName: string
   reason: string
   severity: "high" | "medium" | "low"
   status: "open" | "resolved"
@@ -180,7 +183,8 @@ function toEscalation(row: PrismaEscalation): Escalation {
   return {
     id: row.id,
     auctionId: row.auctionId,
-    bidder: row.bidder,
+    bidderId: row.bidderId,
+    bidderName: row.bidderName,
     reason: row.reason,
     severity: row.severity as Escalation["severity"],
     status: row.status as Escalation["status"],
@@ -470,7 +474,11 @@ export async function createEscalation(
   const row = await prisma.escalation.create({
     data: {
       id: `esc-${Date.now().toString(36)}`,
-      ...input,
+      auctionId: input.auctionId,
+      bidderId: input.bidderId,
+      bidderName: input.bidderName,
+      reason: input.reason,
+      severity: input.severity,
       status: "open",
       createdAt: now(),
     },
@@ -480,11 +488,18 @@ export async function createEscalation(
   return escalation
 }
 
-export async function resolveEscalation(id: string): Promise<Escalation | null> {
+export async function resolveEscalation(id: string, note?: string): Promise<Escalation | null> {
   try {
     const row = await prisma.escalation.update({ where: { id }, data: { status: "resolved" } })
     const escalation = toEscalation(row)
     emit("escalation.resolved", escalation)
+
+    // Write the resolution note to the bidder's message thread so it appears
+    // in the dashboard drawer and fires message.created over SSE.
+    if (note?.trim() && escalation.bidderId) {
+      await addAgentMessage(escalation.bidderId, note.trim(), "system", "Auction agent")
+    }
+
     return escalation
   } catch {
     return null
