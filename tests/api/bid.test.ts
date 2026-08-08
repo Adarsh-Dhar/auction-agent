@@ -1,0 +1,156 @@
+import { describe, it, expect, vi, beforeEach } from "vitest"
+import { POST as postBid } from "@/app/api/auctions/[auctionId]/bid/route"
+import { createTestAuction, createTestBidder, makeRequest, json } from "@/tests/helpers"
+
+// Mock the classifier so bid tests don't need an OpenAI key.
+vi.mock("@/lib/agent/classify", () => ({
+  classifyMessage: vi.fn(),
+}))
+
+import { classifyMessage } from "@/lib/agent/classify"
+const mockClassify = vi.mocked(classifyMessage)
+
+const AUC = "AUC-BID-DIRECT"
+const AUC_LLM = "AUC-BID-LLM"
+
+describe("POST /api/auctions/:auctionId/bid — direct numeric bid", () => {
+  beforeEach(async () => {
+    await createTestAuction({ id: AUC, floor: "$100", topBid: "$0", joinCode: "DIRBID" })
+    await createTestBidder(AUC, { id: "bd-test-d" })
+  })
+
+  it("accepts a valid bid above the floor", async () => {
+    const req = makeRequest(`/api/auctions/${AUC}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-d", amount: "$150" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC }) })
+    expect(res.status).toBe(200)
+    const data = await json<{ auction: { topBid: string } }>(res)
+    expect(data.auction.topBid).toBe("$150")
+  })
+
+  it("rejects a bid below the floor", async () => {
+    const req = makeRequest(`/api/auctions/${AUC}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-d", amount: "$50" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/floor/)
+  })
+
+  it("rejects a bid that does not beat the current top", async () => {
+    await createTestAuction({ id: "AUC-TOP-B", floor: "$100", topBid: "$500", joinCode: "TOPBD1" })
+    await createTestBidder("AUC-TOP-B", { id: "bd-top-b" })
+    const req = makeRequest("/api/auctions/AUC-TOP-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-top-b", amount: "$499" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-TOP-B" }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/top bid/)
+  })
+
+  it("returns 409 for a closed auction", async () => {
+    await createTestAuction({ id: "AUC-CLSD-B", status: "closed", joinCode: "CLSD01" })
+    await createTestBidder("AUC-CLSD-B", { id: "bd-closed-b" })
+    const req = makeRequest("/api/auctions/AUC-CLSD-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-closed-b", amount: "$200" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-CLSD-B" }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/closed/)
+  })
+
+  it("returns 400 when bidderId is missing", async () => {
+    const req = makeRequest(`/api/auctions/${AUC}/bid`, {
+      method: "POST",
+      body: { amount: "$150" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC }) })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
+  beforeEach(async () => {
+    await createTestAuction({ id: AUC_LLM, floor: "$100", topBid: "$0", joinCode: "LLMBID" })
+    await createTestBidder(AUC_LLM, { id: "bd-test-l" })
+  })
+
+  it("places a bid when classifier returns accept with amount", async () => {
+    mockClassify.mockResolvedValueOnce({
+      kind: "bid",
+      amount: "200",
+      decision: "accept",
+      confidence: 0.9,
+      reasoning: "Clear bid of $200.",
+    })
+    const req = makeRequest(`/api/auctions/${AUC_LLM}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-l", rawMessage: "put me down for 200, final" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
+    expect(res.status).toBe(200)
+    const data = await json<{ auction: { topBid: string } }>(res)
+    expect(data.auction.topBid).toBe("$200")
+  })
+
+  it("returns 202 escalation when classifier decision is escalate", async () => {
+    mockClassify.mockResolvedValueOnce({
+      kind: "question",
+      decision: "escalate",
+      confidence: 0.4,
+      reasoning: "Could not determine intent.",
+    })
+    const req = makeRequest(`/api/auctions/${AUC_LLM}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-l", rawMessage: "I'll match whoever's ahead, within reason" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
+    expect(res.status).toBe(202)
+    const data = await json<{ needsEscalation: boolean }>(res)
+    expect(data.needsEscalation).toBe(true)
+  })
+
+  it("returns clarification when classifier decision is clarify", async () => {
+    mockClassify.mockResolvedValueOnce({
+      kind: "question",
+      decision: "clarify",
+      confidence: 0.7,
+      reasoning: "What's the exact amount you'd like to bid?",
+    })
+    const req = makeRequest(`/api/auctions/${AUC_LLM}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-l", rawMessage: "maybe around there" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
+    expect(res.status).toBe(200)
+    const data = await json<{ needsClarification: boolean; question: string }>(res)
+    expect(data.needsClarification).toBe(true)
+    expect(data.question).toBeTruthy()
+  })
+
+  it("escalates when confidence is below 0.55 even if decision is accept", async () => {
+    mockClassify.mockResolvedValueOnce({
+      kind: "bid",
+      amount: "150",
+      decision: "accept",
+      confidence: 0.4,
+      reasoning: "Barely a bid.",
+    })
+    const req = makeRequest(`/api/auctions/${AUC_LLM}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-l", rawMessage: "eh sure 150 or whatever" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
+    expect(res.status).toBe(202)
+    const data = await json<{ needsEscalation: boolean }>(res)
+    expect(data.needsEscalation).toBe(true)
+  })
+})

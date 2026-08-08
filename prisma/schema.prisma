@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Auction {
+  id               String      @id
+  title            String
+  status           String      @default("draft")
+  bidders          Int         @default(0)
+  topBid           String      @default("$0")
+  floor            String
+  endsAt           String
+  createdAt        String
+  terms            String      @default("")
+  channels         String      @default("Web chat") // JSON array stored as string
+  autoExtend       Boolean     @default(true)
+  requiresApproval Boolean     @default(false)
+  joinCode         String      @unique
+
+  bidderRows    Bidder[]
+  escalations   Escalation[]
+  settlements   Settlement[]
+  policyRules   PolicyRule[]
+}
+
+model Bidder {
+  id         String   @id
+  auctionId  String
+  name       String
+  handle     String
+  status     String   @default("active")
+  lastBid    String   @default("—")
+  connection String   @default("Web chat")
+  email      String?
+
+  auction   Auction    @relation(fields: [auctionId], references: [id])
+  messages  Message[]
+}
+
+model Message {
+  id        String  @id
+  bidderId  String
+  author    String
+  body      String
+  kind      String  @default("system")
+  at        String
+
+  bidder    Bidder  @relation(fields: [bidderId], references: [id])
+}
+
+model Escalation {
+  id        String  @id
+  auctionId String
+  bidder    String
+  reason    String
+  severity  String  @default("medium")
+  status    String  @default("open")
+  createdAt String
+
+  auction   Auction @relation(fields: [auctionId], references: [id])
+}
+
+model Settlement {
+  id              String  @id
+  auctionId       String
+  winner          String
+  amount          String
+  asset           String  @default("SOL")
+  wallet          String
+  signature       String  @default("awaiting-wallet-signature")
+  status          String  @default("pending")
+  network         String  @default("Solana devnet")
+  paymentRequest  String
+  verWallet       String  @default("pending")
+  verAmount       String  @default("pending")
+  confirmations   Int     @default(0)
+  updatedAt       String
+
+  auction   Auction @relation(fields: [auctionId], references: [id])
+}
+
+model Settings {
+  id                Int     @id @default(1)
+  reserveProtection Boolean @default(true)
+  autoExtend        Boolean @default(true)
+  humanApproval     Boolean @default(false)
+  webChat           Boolean @default(true)
+  email             Boolean @default(true)
+  sms               Boolean @default(false)
+}
+
+model PolicyRule {
+  id          String  @id
+  auctionId   String?
+  name        String
+  description String  @default("")
+  condition   String
+  action      String
+  active      Boolean @default(true)
+  createdAt   String
+
+  auction     Auction? @relation(fields: [auctionId], references: [id])
+}
+
+model EventLog {
+  id        String  @id
+  auctionId String?
+  type      String
+  payload   String  // JSON string
+  at        String
+  // auctionId is stored for filtering but not enforced as a FK so event logging
+  // never fails due to a missing auction (e.g. global settings.updated events)
+}

@@ -124,3 +124,306 @@ function NewAuctionWizard({ onClose, onCreated }: { onClose: () => void; onCreat
 }
 function Toggle({ label, value, onChange }: { label: string; value: boolean; onChange: (value: boolean) => void }) { return <button className="toggle-row" onClick={() => onChange(!value)}><span>{label}</span><span className={`toggle ${value ? "on" : ""}`}><span /></span></button> }
 function BidderDrawer({ bidder, onClose }: { bidder: Bidder; onClose: () => void }) { const [messages, setMessages] = useState<Message[]>([]); const [reply, setReply] = useState(""); useEffect(() => { fetch(`/api/bidders/${bidder.id}`).then((r) => r.json()).then((data) => setMessages(data.messages)) }, [bidder.id]); const send = async () => { if (!reply.trim()) return; const response = await fetch(`/api/bidders/${bidder.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: reply }) }); const created = await response.json(); setMessages((items) => [...items, created]); setReply("") }; return <div className="drawer-backdrop"><aside className="bidder-drawer"><div className="modal-heading"><div><span className="eyebrow">Bidder thread</span><h2>{bidder.name}</h2><p>{bidder.handle} · {bidder.connection}</p></div><button className="icon-button" onClick={onClose}>×</button></div><div className="thread">{messages.map((message) => <div className={`message ${message.author === "Operator" ? "operator" : ""}`} key={message.id}><div><strong>{message.author}</strong><span className="message-tag">{message.kind}</span></div><p>{message.body}</p><small>{message.at}</small></div>)}</div><div className="reply-box"><textarea value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Write an operator reply…" /><button className="primary-button" onClick={send}>Send reply</button></div></aside></div> }
+
+// ─── Types for policy and events ─────────────────────────────────────────────
+type PolicyRule = {
+  id: string
+  auctionId: string | null
+  name: string
+  description: string
+  condition: string
+  action: string
+  active: boolean
+  createdAt: string
+}
+
+type EventLogEntry = {
+  id: string
+  auctionId: string | null
+  type: string
+  payload: string
+  at: string
+}
+
+// ─── PolicyView ───────────────────────────────────────────────────────────────
+
+export function PolicyView() {
+  const [rules, setRules] = useState<PolicyRule[]>([])
+  const [auctions, setAuctions] = useState<Auction[]>([])
+  const [showForm, setShowForm] = useState(false)
+  const [form, setForm] = useState({ name: "", description: "", condition: "", action: "", auctionId: "" })
+  const [saving, setSaving] = useState(false)
+  const [filterAuction, setFilterAuction] = useState("")
+
+  useEffect(() => {
+    const url = filterAuction ? `/api/policy?auctionId=${filterAuction}` : "/api/policy"
+    fetch(url).then((r) => r.json()).then(setRules)
+  }, [filterAuction])
+
+  useEffect(() => {
+    fetch("/api/auctions").then((r) => r.json()).then(setAuctions)
+  }, [])
+
+  const update = (key: string, value: string) => setForm((f) => ({ ...f, [key]: value }))
+
+  const save = async () => {
+    if (!form.name || !form.condition || !form.action) return
+    setSaving(true)
+    const res = await fetch("/api/policy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...form, auctionId: form.auctionId || undefined }),
+    })
+    const created = await res.json()
+    setRules((r) => [created, ...r])
+    setForm({ name: "", description: "", condition: "", action: "", auctionId: "" })
+    setShowForm(false)
+    setSaving(false)
+  }
+
+  const toggle = async (rule: PolicyRule) => {
+    const res = await fetch("/api/policy", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: rule.id, active: !rule.active }),
+    })
+    const updated = await res.json()
+    setRules((r) => r.map((item) => (item.id === updated.id ? updated : item)))
+  }
+
+  const remove = async (id: string) => {
+    await fetch(`/api/policy?id=${id}`, { method: "DELETE" })
+    setRules((r) => r.filter((item) => item.id !== id))
+  }
+
+  return (
+    <AuctionShell
+      title="Policy rules"
+      eyebrow="Agent behaviour"
+      action={
+        <button className="primary-button" onClick={() => setShowForm((v) => !v)}>
+          {showForm ? "Cancel" : "+ New rule"}
+        </button>
+      }
+    >
+      <div className="policy-summary">
+        <p className="hero-copy">
+          Rules define how the agent classifies, accepts, rejects, and escalates bidder messages.
+          Global rules apply to all auctions; auction-specific rules override them for that room.
+        </p>
+      </div>
+
+      {/* Auction filter */}
+      <div className="toolbar" style={{ marginBottom: "1rem" }}>
+        <div className="segmented-control">
+          <button className={!filterAuction ? "active" : ""} onClick={() => setFilterAuction("")}>All</button>
+          {auctions.map((a) => (
+            <button key={a.id} className={filterAuction === a.id ? "active" : ""} onClick={() => setFilterAuction(a.id)}>
+              {a.id}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* New-rule form */}
+      {showForm && (
+        <div className="panel" style={{ marginBottom: "1.5rem" }}>
+          <div className="panel-title"><span className="eyebrow">New rule</span></div>
+          <div className="form-stack">
+            <label>Rule name<input value={form.name} onChange={(e) => update("name", e.target.value)} placeholder="Reserve floor enforcement" /></label>
+            <label>Description<input value={form.description} onChange={(e) => update("description", e.target.value)} placeholder="What this rule does…" /></label>
+            <label>Condition (plain text)<input value={form.condition} onChange={(e) => update("condition", e.target.value)} placeholder="bid_amount &lt; floor" /></label>
+            <label>Action<input value={form.action} onChange={(e) => update("action", e.target.value)} placeholder="reject_bid | escalate_to_operator | extend_5m" /></label>
+            <label>
+              Auction (optional — leave blank for global)
+              <select value={form.auctionId} onChange={(e) => update("auctionId", e.target.value)}>
+                <option value="">Global (all auctions)</option>
+                {auctions.map((a) => <option key={a.id} value={a.id}>{a.id} — {a.title}</option>)}
+              </select>
+            </label>
+            <button className="primary-button" disabled={!form.name || !form.condition || !form.action || saving} onClick={save}>
+              {saving ? "Saving…" : "Create rule"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Rules list */}
+      <div className="list-panel">
+        {rules.length === 0 && (
+          <div className="empty-state"><p>No policy rules yet</p><small>Create a rule to define how the agent handles bids and messages.</small></div>
+        )}
+        {rules.map((rule) => (
+          <div className="list-row" key={rule.id}>
+            <div className="list-row-main">
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.25rem" }}>
+                <span className={badgeClass(rule.active ? "live" : "closed")}>{rule.active ? "active" : "inactive"}</span>
+                {rule.auctionId && <span className="eyebrow">{rule.auctionId}</span>}
+              </div>
+              <h3>{rule.name}</h3>
+              {rule.description && <p style={{ margin: "0.15rem 0", fontSize: "0.75rem", color: "var(--muted-foreground)" }}>{rule.description}</p>}
+              <p style={{ fontSize: "0.72rem", color: "var(--muted-foreground)", marginTop: "0.25rem" }}>
+                <code style={{ background: "var(--surface)", padding: "1px 5px", borderRadius: 3 }}>{rule.condition}</code>
+                {" → "}
+                <code style={{ background: "var(--surface)", padding: "1px 5px", borderRadius: 3 }}>{rule.action}</code>
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <button className="secondary-button" onClick={() => toggle(rule)}>{rule.active ? "Disable" : "Enable"}</button>
+              <button className="secondary-button" onClick={() => remove(rule.id)} style={{ color: "var(--destructive, oklch(0.65 0.2 25))" }}>Delete</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </AuctionShell>
+  )
+}
+
+// ─── EventsView ───────────────────────────────────────────────────────────────
+
+const EVENT_TONE: Record<string, string> = {
+  "bid.placed": "positive",
+  "bidder.joined": "positive",
+  "auction.created": "positive",
+  "settlement.confirmed": "positive",
+  "escalation.created": "negative",
+  "escalation.resolved": "positive",
+  "escalation.reopened": "warning",
+  "settlement.failed": "negative",
+  "settlement.created": "neutral",
+  "settlement.verifying": "neutral",
+  "message.created": "neutral",
+  "settings.updated": "neutral",
+  "policy.created": "neutral",
+  "policy.updated": "neutral",
+  "policy.deleted": "warning",
+}
+
+function eventTag(type: string): string {
+  if (type.startsWith("bid")) return "BID"
+  if (type.startsWith("bidder")) return "BIDDER"
+  if (type.startsWith("auction")) return "AUCTION"
+  if (type.startsWith("escalation")) return "ESCALATION"
+  if (type.startsWith("settlement")) return "SETTLEMENT"
+  if (type.startsWith("message")) return "MESSAGE"
+  if (type.startsWith("policy")) return "POLICY"
+  return "EVENT"
+}
+
+function formatPayload(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw)
+    // Surface the most readable fields
+    const parts: string[] = []
+    if (parsed.amount) parts.push(`amount: ${parsed.amount}`)
+    if (parsed.auctionId) parts.push(parsed.auctionId)
+    if (parsed.bidderId) parts.push(`bidder: ${parsed.bidderId}`)
+    if (parsed.winner) parts.push(`winner: ${parsed.winner}`)
+    if (parsed.status) parts.push(`status: ${parsed.status}`)
+    if (parsed.reason) parts.push(parsed.reason)
+    if (parsed.name) parts.push(parsed.name)
+    return parts.join(" · ") || JSON.stringify(parsed).slice(0, 80)
+  } catch {
+    return raw.slice(0, 80)
+  }
+}
+
+export function EventsView() {
+  const [events, setEvents] = useState<EventLogEntry[]>([])
+  const [auctions, setAuctions] = useState<Auction[]>([])
+  const [filterAuction, setFilterAuction] = useState("")
+  const [filterType, setFilterType] = useState("")
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetch("/api/auctions").then((r) => r.json()).then(setAuctions)
+  }, [])
+
+  useEffect(() => {
+    setLoading(true)
+    const url = filterAuction ? `/api/events?auctionId=${filterAuction}` : "/api/events"
+    fetch(url)
+      .then((r) => r.json())
+      .then((data) => { setEvents(data); setLoading(false) })
+  }, [filterAuction])
+
+  const eventTypes = [...new Set(events.map((e) => e.type))].sort()
+  const visible = filterType ? events.filter((e) => e.type === filterType) : events
+
+  return (
+    <AuctionShell title="Event log" eyebrow="Agent activity timeline">
+      {/* Filters */}
+      <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginBottom: "1.25rem" }}>
+        <div className="segmented-control">
+          <button className={!filterAuction ? "active" : ""} onClick={() => setFilterAuction("")}>All auctions</button>
+          {auctions.map((a) => (
+            <button key={a.id} className={filterAuction === a.id ? "active" : ""} onClick={() => setFilterAuction(a.id)}>
+              {a.id}
+            </button>
+          ))}
+        </div>
+        {eventTypes.length > 0 && (
+          <div className="segmented-control">
+            <button className={!filterType ? "active" : ""} onClick={() => setFilterType("")}>All types</button>
+            {eventTypes.map((t) => (
+              <button key={t} className={filterType === t ? "active" : ""} onClick={() => setFilterType(t)}>
+                {eventTag(t)}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Timeline */}
+      <section className="panel">
+        <div className="section-heading compact">
+          <div>
+            <span className="eyebrow">Agent audit trail</span>
+            <h2 className="section-title">Activity feed</h2>
+          </div>
+          <span className="live-indicator">
+            <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "var(--primary, oklch(0.7 0.25 280))", marginRight: 4 }} />
+            {visible.length} events
+          </span>
+        </div>
+
+        {loading && <div className="empty-state"><p>Loading events…</p></div>}
+
+        {!loading && visible.length === 0 && (
+          <div className="empty-state">
+            <p>No events yet</p>
+            <small>Events are recorded automatically as bids, messages, and escalations happen.</small>
+          </div>
+        )}
+
+        <div className="activity-list">
+          {visible.map((event) => {
+            const tone = EVENT_TONE[event.type] ?? "neutral"
+            const tag = eventTag(event.type)
+            const summary = formatPayload(event.payload)
+            const time = event.at ? new Date(event.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"
+
+            return (
+              <div className="activity-row" key={event.id}>
+                <span className="activity-time">{time}</span>
+                <span className={`activity-status ${tone}`} />
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.825rem", color: "var(--foreground)" }}>
+                    <span>{event.type}</span>
+                    <span className="event-tag">{tag}</span>
+                    {event.auctionId && <span className="eyebrow">{event.auctionId}</span>}
+                  </div>
+                  {summary && (
+                    <div style={{ marginTop: "0.2rem", fontSize: "0.72rem", color: "var(--muted-foreground)", lineHeight: 1.5 }}>
+                      {summary}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+    </AuctionShell>
+  )
+}

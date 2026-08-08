@@ -1,4 +1,25 @@
+/**
+ * auction-store.ts — Prisma-backed data layer
+ *
+ * All public function signatures are async and mirror the previous in-memory
+ * API exactly, so existing call sites only need an `await` added.
+ *
+ * The EventEmitter is kept for SSE — it doesn't need to be persisted.
+ * Every mutation calls emit() AND logEvent() so the EventLog table grows in
+ * step with real activity.
+ */
 import { EventEmitter } from "node:events"
+import { prisma } from "@/lib/db"
+import type {
+  Auction as PrismaAuction,
+  Bidder as PrismaBidder,
+  Message as PrismaMessage,
+  Escalation as PrismaEscalation,
+  Settlement as PrismaSettlement,
+  Settings as PrismaSettings,
+} from "@prisma/client"
+
+// ─── Re-exported types ────────────────────────────────────────────────────────
 
 export type AuctionStatus = "live" | "draft" | "closed" | "paused"
 export type MessageKind = "intent" | "question" | "bid" | "system" | "risk"
@@ -19,67 +40,286 @@ export type Auction = {
   joinCode: string
 }
 
-export type Bidder = { id: string; name: string; handle: string; status: "active" | "quiet" | "dropped"; lastBid: string; connection: string; email?: string }
-export type Message = { id: string; bidderId: string; author: string; body: string; kind: MessageKind; at: string }
-export type Escalation = { id: string; auctionId: string; bidder: string; reason: string; severity: "high" | "medium" | "low"; status: "open" | "resolved"; createdAt: string }
-export type Settlement = { id: string; auctionId: string; winner: string; amount: string; asset: "SOL" | "USDC"; wallet: string; signature: string; status: "pending" | "verifying" | "confirmed" | "failed"; network: "Solana mainnet" | "Solana devnet"; paymentRequest: string; verification: { wallet: "pending" | "matched" | "mismatch"; amount: "pending" | "matched" | "mismatch"; confirmations: number }; updatedAt: string }
+export type Bidder = {
+  id: string
+  name: string
+  handle: string
+  status: "active" | "quiet" | "dropped"
+  lastBid: string
+  connection: string
+  email?: string
+}
+
+export type Message = {
+  id: string
+  bidderId: string
+  author: string
+  body: string
+  kind: MessageKind
+  at: string
+}
+
+export type Escalation = {
+  id: string
+  auctionId: string
+  bidder: string
+  reason: string
+  severity: "high" | "medium" | "low"
+  status: "open" | "resolved"
+  createdAt: string
+}
+
+export type Settlement = {
+  id: string
+  auctionId: string
+  winner: string
+  amount: string
+  asset: "SOL" | "USDC"
+  wallet: string
+  signature: string
+  status: "pending" | "verifying" | "confirmed" | "failed"
+  network: "Solana mainnet" | "Solana devnet"
+  paymentRequest: string
+  verification: {
+    wallet: "pending" | "matched" | "mismatch"
+    amount: "pending" | "matched" | "mismatch"
+    confirmations: number
+  }
+  updatedAt: string
+}
+
+// ─── SSE event bus ────────────────────────────────────────────────────────────
+
+const _events = new EventEmitter()
+_events.setMaxListeners(100)
 
 const now = () => new Date().toISOString()
-const events = new EventEmitter()
 
-// Room-code style join codes (like Ludo King): short, unambiguous, easy to read aloud.
-// Excludes visually-confusable characters (0/O, 1/I/L).
+export const auctionStore = {
+  /** The EventEmitter used by the SSE stream route. */
+  events: _events,
+}
+
+export function emit(type: string, payload: unknown) {
+  _events.emit("auction", { type, payload, at: now() })
+  // Persist asynchronously — fire-and-forget, never blocks the response
+  logEvent(type, payload).catch(() => {})
+}
+
+export async function logEvent(type: string, payload: unknown, auctionId?: string) {
+  await prisma.eventLog.create({
+    data: {
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type,
+      payload: JSON.stringify(payload),
+      at: now(),
+      auctionId: auctionId ?? extractAuctionId(payload),
+    },
+  })
+}
+
+function extractAuctionId(payload: unknown): string | null {
+  if (payload && typeof payload === "object") {
+    const p = payload as Record<string, unknown>
+    if (typeof p.auctionId === "string") return p.auctionId
+    if (typeof p.id === "string" && p.id.startsWith("AUC-")) return p.id
+  }
+  return null
+}
+
+// ─── Shape converters (Prisma row → domain type) ──────────────────────────────
+
+function toAuction(row: PrismaAuction): Auction {
+  let channels: string[]
+  try {
+    channels = JSON.parse(row.channels)
+  } catch {
+    channels = row.channels ? row.channels.split(",").map((s) => s.trim()) : ["Web chat"]
+  }
+  return {
+    id: row.id,
+    title: row.title,
+    status: row.status as AuctionStatus,
+    bidders: row.bidders,
+    topBid: row.topBid,
+    floor: row.floor,
+    endsAt: row.endsAt,
+    createdAt: row.createdAt,
+    terms: row.terms,
+    channels,
+    autoExtend: row.autoExtend,
+    requiresApproval: row.requiresApproval,
+    joinCode: row.joinCode,
+  }
+}
+
+function toBidder(row: PrismaBidder): Bidder {
+  return {
+    id: row.id,
+    name: row.name,
+    handle: row.handle,
+    status: row.status as Bidder["status"],
+    lastBid: row.lastBid,
+    connection: row.connection,
+    email: row.email ?? undefined,
+  }
+}
+
+function toMessage(row: PrismaMessage): Message {
+  return {
+    id: row.id,
+    bidderId: row.bidderId,
+    author: row.author,
+    body: row.body,
+    kind: row.kind as MessageKind,
+    at: row.at,
+  }
+}
+
+function toEscalation(row: PrismaEscalation): Escalation {
+  return {
+    id: row.id,
+    auctionId: row.auctionId,
+    bidder: row.bidder,
+    reason: row.reason,
+    severity: row.severity as Escalation["severity"],
+    status: row.status as Escalation["status"],
+    createdAt: row.createdAt,
+  }
+}
+
+function toSettlement(row: PrismaSettlement): Settlement {
+  return {
+    id: row.id,
+    auctionId: row.auctionId,
+    winner: row.winner,
+    amount: row.amount,
+    asset: row.asset as Settlement["asset"],
+    wallet: row.wallet,
+    signature: row.signature,
+    status: row.status as Settlement["status"],
+    network: row.network as Settlement["network"],
+    paymentRequest: row.paymentRequest,
+    verification: {
+      wallet: row.verWallet as Settlement["verification"]["wallet"],
+      amount: row.verAmount as Settlement["verification"]["amount"],
+      confirmations: row.confirmations,
+    },
+    updatedAt: row.updatedAt,
+  }
+}
+
+// ─── Join code helpers ────────────────────────────────────────────────────────
+
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
 function generateJoinCode(length = 6): string {
   let code = ""
   for (let i = 0; i < length; i++) code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]
   return code
 }
-function generateUniqueJoinCode(): string {
+
+async function generateUniqueJoinCode(): Promise<string> {
   let code = generateJoinCode()
-  while (auctions.some((auction) => auction.joinCode === code)) code = generateJoinCode()
+  while (await prisma.auction.findUnique({ where: { joinCode: code } })) {
+    code = generateJoinCode()
+  }
   return code
 }
 
-// Currency values are stored as display strings (e.g. "$2,450"); these convert
-// to/from numbers so bids can be compared against the floor and current top bid.
-function parseCurrency(value: string): number {
+// ─── Currency helpers ─────────────────────────────────────────────────────────
+
+export function parseCurrency(value: string): number {
   const cleaned = value.replace(/[^0-9.]/g, "")
   return cleaned ? Number.parseFloat(cleaned) : NaN
 }
-function formatCurrency(value: number): string {
+
+export function formatCurrency(value: number): string {
   return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
 }
 
-const auctions: Auction[] = [
-  { id: "AUC-1048", title: "Signed first-edition design book", status: "live", bidders: 7, topBid: "$2,450", floor: "$1,800", endsAt: "2026-08-09T18:30:00.000Z", createdAt: now(), terms: "Winner pays within 48 hours. Shipping included.", channels: ["Web chat", "Email"], autoExtend: true, requiresApproval: true, joinCode: "K7P2QX" },
-  { id: "AUC-1047", title: "Studio portrait commission", status: "live", bidders: 4, topBid: "$980", floor: "$750", endsAt: "2026-08-10T13:00:00.000Z", createdAt: now(), terms: "Final deliverables due within 30 days.", channels: ["Web chat"], autoExtend: false, requiresApproval: false, joinCode: "R9TZ4M" },
-  { id: "AUC-1046", title: "Rare analog synthesizer", status: "draft", bidders: 0, topBid: "$0", floor: "$1,200", endsAt: "2026-08-14T20:00:00.000Z", createdAt: now(), terms: "Local pickup preferred.", channels: ["Web chat", "SMS"], autoExtend: true, requiresApproval: true, joinCode: "8HD3WY" },
-]
-const bidders: Record<string, Bidder[]> = { "AUC-1048": [
-  { id: "bd-1", name: "Maya Chen", handle: "maya.chen", status: "active", lastBid: "$2,450", connection: "Web chat" },
-  { id: "bd-2", name: "Jon Bell", handle: "jon.bell", status: "active", lastBid: "$2,300", connection: "Email" },
-  { id: "bd-3", name: "Rae Okafor", handle: "rae.o", status: "quiet", lastBid: "$2,050", connection: "Web chat" },
-], "AUC-1047": [] }
-const messages: Record<string, Message[]> = { "bd-1": [
-  { id: "m-1", bidderId: "bd-1", author: "Maya Chen", body: "I can move to $2,450 if shipping is included.", kind: "intent", at: "10:42:18" },
-  { id: "m-2", bidderId: "bd-1", author: "Auction agent", body: "Shipping is included for the winning bid. Would you like to place $2,450?", kind: "system", at: "10:42:36" },
-  { id: "m-3", bidderId: "bd-1", author: "Maya Chen", body: "Yes, place the bid.", kind: "bid", at: "10:42:51" },
-  { id: "m-4", bidderId: "bd-1", author: "Auction agent", body: "Bid accepted. You are currently in first place.", kind: "system", at: "10:42:53" },
-], "bd-2": [{ id: "m-5", bidderId: "bd-2", author: "Jon Bell", body: "Is there a certificate of authenticity?", kind: "question", at: "10:39:02" }, { id: "m-6", bidderId: "bd-2", author: "Auction agent", body: "The seller has provided a signed provenance card.", kind: "system", at: "10:39:22" }], "bd-3": [{ id: "m-7", bidderId: "bd-3", author: "Rae Okafor", body: "This feels outside my budget now.", kind: "risk", at: "10:34:07" }] }
-const escalations: Escalation[] = [{ id: "esc-1", auctionId: "AUC-1048", bidder: "Rae Okafor", reason: "Bidder requested a reserve exception", severity: "high", status: "open", createdAt: now() }, { id: "esc-2", auctionId: "AUC-1047", bidder: "Jon Bell", reason: "Identity verification pending", severity: "medium", status: "open", createdAt: now() }]
-const settlements: Settlement[] = [{ id: "set-1", auctionId: "AUC-1045", winner: "Liam Torres", amount: "3.2", asset: "SOL", wallet: "7Gf...k91Q", signature: "5oT...8xL", status: "confirmed", network: "Solana mainnet", paymentRequest: "solana:7Gf...k91Q?amount=3.2", verification: { wallet: "matched", amount: "matched", confirmations: 32 }, updatedAt: now() }]
-const settings = { reserveProtection: true, autoExtend: true, humanApproval: false, webChat: true, email: true, sms: false }
+// ─── Auction queries ──────────────────────────────────────────────────────────
 
-export const auctionStore = { auctions, bidders, messages, escalations, settlements, settings, events }
-export function emit(type: string, payload: unknown) { events.emit("auction", { type, payload, at: now() }) }
-export function createAuction(input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode">) { const auction: Auction = { ...input, id: `AUC-${1049 + auctions.length}`, createdAt: now(), bidders: 0, topBid: "$0", joinCode: generateUniqueJoinCode() }; auctions.unshift(auction); bidders[auction.id] = []; emit("auction.created", auction); return auction }
+export async function getAuctions(): Promise<Auction[]> {
+  const rows = await prisma.auction.findMany({ orderBy: { createdAt: "desc" } })
+  return rows.map(toAuction)
+}
 
-// Regenerates the join code for an auction, e.g. if the seller thinks it leaked.
-export function rotateJoinCode(auctionId: string) { const auction = auctions.find((entry) => entry.id === auctionId); if (auction) { auction.joinCode = generateUniqueJoinCode(); emit("auction.codeRotated", auction) }; return auction }
+export async function getAuction(id: string): Promise<Auction | null> {
+  const row = await prisma.auction.findUnique({ where: { id } })
+  return row ? toAuction(row) : null
+}
 
-// Parses a chat-style join command, e.g. "/join K7P2QX" or "join k7p2qx".
-// Returns the extracted code (uppercased) or null if the message isn't a join command.
+export async function createAuction(
+  input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode">
+): Promise<Auction> {
+  // Generate a sequential-style ID based on current count
+  const count = await prisma.auction.count()
+  const id = `AUC-${1049 + count}`
+  const joinCode = await generateUniqueJoinCode()
+
+  const row = await prisma.auction.create({
+    data: {
+      id,
+      title: input.title,
+      status: input.status,
+      floor: input.floor,
+      endsAt: input.endsAt,
+      createdAt: now(),
+      terms: input.terms,
+      channels: JSON.stringify(input.channels),
+      autoExtend: input.autoExtend,
+      requiresApproval: input.requiresApproval,
+      joinCode,
+      bidders: 0,
+      topBid: "$0",
+    },
+  })
+
+  const auction = toAuction(row)
+  emit("auction.created", auction)
+  return auction
+}
+
+export async function rotateJoinCode(auctionId: string): Promise<Auction | null> {
+  const joinCode = await generateUniqueJoinCode()
+  try {
+    const row = await prisma.auction.update({ where: { id: auctionId }, data: { joinCode } })
+    const auction = toAuction(row)
+    emit("auction.codeRotated", auction)
+    return auction
+  } catch {
+    return null
+  }
+}
+
+// ─── Bidder queries ───────────────────────────────────────────────────────────
+
+export async function getBiddersForAuction(auctionId: string): Promise<Bidder[]> {
+  const rows = await prisma.bidder.findMany({ where: { auctionId } })
+  return rows.map(toBidder)
+}
+
+export async function findBidderById(bidderId: string): Promise<Bidder | null> {
+  const row = await prisma.bidder.findUnique({ where: { id: bidderId } })
+  return row ? toBidder(row) : null
+}
+
+export async function findBidderByEmail(email: string): Promise<{ auction: Auction; bidder: Bidder } | null> {
+  const normalized = email.trim().toLowerCase()
+  // SQLite is case-insensitive for ASCII by default, so a simple equals works.
+  // For full Unicode safety we do a JS-level toLowerCase comparison after fetching candidates.
+  const rows = await prisma.bidder.findMany({
+    where: { email: { not: null } },
+    include: { auction: true },
+  })
+  const row = rows.find((r) => r.email?.toLowerCase() === normalized)
+  if (!row) return null
+  return { auction: toAuction(row.auction), bidder: toBidder(row) }
+}
+
+// ─── Join flow ────────────────────────────────────────────────────────────────
+
 export function parseJoinCommand(message: string): string | null {
   const match = message.trim().match(/^\/?join\s+([a-z0-9]{4,8})$/i)
   return match ? match[1].toUpperCase() : null
@@ -89,71 +329,315 @@ export type JoinResult =
   | { ok: true; auction: Auction; bidder: Bidder }
   | { ok: false; reason: "invalid_code" | "auction_closed" }
 
-// A bidder joins an auction by presenting the room code the seller shared with them.
-// This is the gate that stops anyone who doesn't have the code from being added.
-export function joinAuctionByCode(code: string, applicant: { name: string; handle: string; connection: string; email?: string }): JoinResult {
+export async function joinAuctionByCode(
+  code: string,
+  applicant: { name: string; handle: string; connection: string; email?: string }
+): Promise<JoinResult> {
   const normalized = code.trim().toUpperCase()
-  const auction = auctions.find((entry) => entry.joinCode === normalized)
-  if (!auction) return { ok: false, reason: "invalid_code" }
-  if (auction.status === "closed") return { ok: false, reason: "auction_closed" }
-  const roster = bidders[auction.id] || (bidders[auction.id] = [])
-  const existing = roster.find((entry) => entry.handle.toLowerCase() === applicant.handle.toLowerCase())
-  if (existing) return { ok: true, auction, bidder: existing }
-  const bidder: Bidder = { id: `bd-${Date.now().toString(36)}`, name: applicant.name, handle: applicant.handle, status: "active", lastBid: "—", connection: applicant.connection, email: applicant.email }
-  roster.push(bidder)
-  auction.bidders = roster.length
-  emit("bidder.joined", { auctionId: auction.id, bidder })
-  return { ok: true, auction, bidder }
+  const auctionRow = await prisma.auction.findUnique({ where: { joinCode: normalized } })
+  if (!auctionRow) return { ok: false, reason: "invalid_code" }
+  if (auctionRow.status === "closed") return { ok: false, reason: "auction_closed" }
+
+  // Idempotent re-join
+  const existingRows = await prisma.bidder.findMany({ where: { auctionId: auctionRow.id } })
+  const existing = existingRows.find((b) => b.handle.toLowerCase() === applicant.handle.toLowerCase())
+  if (existing) return { ok: true, auction: toAuction(auctionRow), bidder: toBidder(existing) }
+
+  const bidder = await prisma.bidder.create({
+    data: {
+      id: `bd-${Date.now().toString(36)}`,
+      auctionId: auctionRow.id,
+      name: applicant.name,
+      handle: applicant.handle,
+      status: "active",
+      lastBid: "—",
+      connection: applicant.connection,
+      email: applicant.email,
+    },
+  })
+
+  // Increment bidder count
+  const updatedAuction = await prisma.auction.update({
+    where: { id: auctionRow.id },
+    data: { bidders: { increment: 1 } },
+  })
+
+  const auction = toAuction(updatedAuction)
+  emit("bidder.joined", { auctionId: auction.id, bidder: toBidder(bidder) })
+  return { ok: true, auction, bidder: toBidder(bidder) }
 }
 
-// Looks up which auction (if any) an email address has already joined, keyed by
-// the email stored on the bidder record. Used by the email channel to route a
-// reply to "bid"/"status"/question intents without asking for the code again.
-export function findBidderByEmail(email: string): { auction: Auction; bidder: Bidder } | null {
-  const normalized = email.trim().toLowerCase()
-  for (const auction of auctions) {
-    const roster = bidders[auction.id] || []
-    const match = roster.find((entry) => entry.email && entry.email.toLowerCase() === normalized)
-    if (match) return { auction, bidder: match }
-  }
-  return null
-}
+// ─── Bid flow ─────────────────────────────────────────────────────────────────
 
 export type BidResult =
   | { ok: true; auction: Auction; bidder: Bidder; outbid: Bidder | null }
   | { ok: false; reason: "not_found" | "auction_closed" | "invalid_amount" | "below_floor" | "below_top_bid" }
 
-// Places a bid for a bidder already on the roster. Rejects amounts that don't
-// clear the reserve floor or the current top bid, and reports whoever previously
-// held the top bid (if they're a different bidder) so they can be notified.
-export function placeBid(auctionId: string, bidderId: string, rawAmount: string): BidResult {
-  const auction = auctions.find((entry) => entry.id === auctionId)
-  if (!auction) return { ok: false, reason: "not_found" }
-  if (auction.status === "closed") return { ok: false, reason: "auction_closed" }
-  const roster = bidders[auctionId] || []
-  const bidder = roster.find((entry) => entry.id === bidderId)
-  if (!bidder) return { ok: false, reason: "not_found" }
+export async function placeBid(auctionId: string, bidderId: string, rawAmount: string): Promise<BidResult> {
+  const auctionRow = await prisma.auction.findUnique({ where: { id: auctionId } })
+  if (!auctionRow) return { ok: false, reason: "not_found" }
+  if (auctionRow.status === "closed") return { ok: false, reason: "auction_closed" }
+
+  const bidderRow = await prisma.bidder.findFirst({ where: { id: bidderId, auctionId } })
+  if (!bidderRow) return { ok: false, reason: "not_found" }
 
   const amount = parseCurrency(rawAmount)
   if (Number.isNaN(amount)) return { ok: false, reason: "invalid_amount" }
 
-  const floor = parseCurrency(auction.floor)
-  const topBid = parseCurrency(auction.topBid)
+  const floor = parseCurrency(auctionRow.floor)
+  const topBid = parseCurrency(auctionRow.topBid)
+
   if (!Number.isNaN(floor) && amount < floor) return { ok: false, reason: "below_floor" }
-  if (!Number.isNaN(topBid) && amount <= topBid) return { ok: false, reason: "below_top_bid" }
+  if (!Number.isNaN(topBid) && topBid > 0 && amount <= topBid) return { ok: false, reason: "below_top_bid" }
 
-  const previousLeader = roster.find((entry) => entry.id !== bidderId && parseCurrency(entry.lastBid) === topBid) || null
+  // Find the outbid leader (different bidder who had the previous top bid)
+  let outbid: Bidder | null = null
+  if (!Number.isNaN(topBid) && topBid > 0) {
+    const topBidFormatted = formatCurrency(topBid)
+    const outbidRow = await prisma.bidder.findFirst({
+      where: { auctionId, id: { not: bidderId }, lastBid: topBidFormatted },
+    })
+    if (outbidRow) outbid = toBidder(outbidRow)
+  }
 
-  bidder.lastBid = formatCurrency(amount)
-  bidder.status = "active"
-  auction.topBid = formatCurrency(amount)
+  const formatted = formatCurrency(amount)
+  const [updatedBidder, updatedAuction] = await prisma.$transaction([
+    prisma.bidder.update({ where: { id: bidderId }, data: { lastBid: formatted, status: "active" } }),
+    prisma.auction.update({ where: { id: auctionId }, data: { topBid: formatted } }),
+  ])
+
+  const auction = toAuction(updatedAuction)
+  const bidder = toBidder(updatedBidder)
+
   emit("bid.placed", { auctionId, bidderId: bidder.id, amount: bidder.lastBid })
-
-  return { ok: true, auction, bidder, outbid: previousLeader }
+  return { ok: true, auction, bidder, outbid }
 }
-export function resolveEscalation(id: string) { const item = escalations.find((entry) => entry.id === id); if (item) { item.status = "resolved"; emit("escalation.resolved", item) }; return item }
-export function addMessage(bidderId: string, body: string) { const message: Message = { id: `m-${Date.now()}`, bidderId, author: "Operator", body, kind: "system", at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }; messages[bidderId] = [...(messages[bidderId] || []), message]; emit("message.created", message); return message }
-export function createSettlement(input: Pick<Settlement, "winner" | "amount" | "asset" | "wallet" | "auctionId">) { const settlement: Settlement = { ...input, id: `set-${Date.now()}`, signature: "awaiting-wallet-signature", status: "pending", network: "Solana devnet", paymentRequest: `solana:${input.wallet}?amount=${input.amount}&label=Auction%20settlement`, verification: { wallet: "pending", amount: "pending", confirmations: 0 }, updatedAt: now() }; settlements.unshift(settlement); emit("settlement.created", settlement); return settlement }
-export function updateSettlement(id: string, status: Settlement["status"]) { const item = settlements.find((entry) => entry.id === id); if (item) { item.status = status; item.updatedAt = now(); if (status === "verifying") item.verification = { wallet: "matched", amount: "matched", confirmations: 1 }; if (status === "confirmed") { item.signature = `sim-${Date.now().toString(36)}`; item.network = "Solana mainnet"; item.verification = { wallet: "matched", amount: "matched", confirmations: 32 } }; if (status === "failed") item.verification = { wallet: "mismatch", amount: "pending", confirmations: 0 }; emit(`settlement.${status}`, item) }; return item }
-export function getSettlement(id: string) { return settlements.find((entry) => entry.id === id) }
-export function reopenEscalation(id: string) { const item = escalations.find((entry) => entry.id === id); if (item) { item.status = "open"; emit("escalation.reopened", item) }; return item }
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+
+export async function getMessages(bidderId: string): Promise<Message[]> {
+  const rows = await prisma.message.findMany({ where: { bidderId }, orderBy: { at: "asc" } })
+  return rows.map(toMessage)
+}
+
+export async function addMessage(bidderId: string, body: string, kind: MessageKind = "system"): Promise<Message> {
+  const row = await prisma.message.create({
+    data: {
+      id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      bidderId,
+      author: "Operator",
+      body,
+      kind,
+      at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    },
+  })
+  const message = toMessage(row)
+  emit("message.created", message)
+  return message
+}
+
+export async function addAgentMessage(
+  bidderId: string,
+  body: string,
+  kind: MessageKind = "system",
+  author = "Auction agent"
+): Promise<Message> {
+  const row = await prisma.message.create({
+    data: {
+      id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      bidderId,
+      author,
+      body,
+      kind,
+      at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    },
+  })
+  const message = toMessage(row)
+  emit("message.created", message)
+  return message
+}
+
+// ─── Escalations ──────────────────────────────────────────────────────────────
+
+export async function getEscalations(): Promise<Escalation[]> {
+  const rows = await prisma.escalation.findMany({ orderBy: { createdAt: "desc" } })
+  return rows.map(toEscalation)
+}
+
+export async function createEscalation(
+  input: Omit<Escalation, "id" | "createdAt" | "status">
+): Promise<Escalation> {
+  const row = await prisma.escalation.create({
+    data: {
+      id: `esc-${Date.now().toString(36)}`,
+      ...input,
+      status: "open",
+      createdAt: now(),
+    },
+  })
+  const escalation = toEscalation(row)
+  emit("escalation.created", escalation)
+  return escalation
+}
+
+export async function resolveEscalation(id: string): Promise<Escalation | null> {
+  try {
+    const row = await prisma.escalation.update({ where: { id }, data: { status: "resolved" } })
+    const escalation = toEscalation(row)
+    emit("escalation.resolved", escalation)
+    return escalation
+  } catch {
+    return null
+  }
+}
+
+export async function reopenEscalation(id: string): Promise<Escalation | null> {
+  try {
+    const row = await prisma.escalation.update({ where: { id }, data: { status: "open" } })
+    const escalation = toEscalation(row)
+    emit("escalation.reopened", escalation)
+    return escalation
+  } catch {
+    return null
+  }
+}
+
+// ─── Settlements ──────────────────────────────────────────────────────────────
+
+export async function getSettlements(): Promise<Settlement[]> {
+  const rows = await prisma.settlement.findMany({ orderBy: { updatedAt: "desc" } })
+  return rows.map(toSettlement)
+}
+
+export async function getSettlement(id: string): Promise<Settlement | null> {
+  const row = await prisma.settlement.findUnique({ where: { id } })
+  return row ? toSettlement(row) : null
+}
+
+export async function createSettlement(
+  input: Pick<Settlement, "winner" | "amount" | "asset" | "wallet" | "auctionId">
+): Promise<Settlement> {
+  const row = await prisma.settlement.create({
+    data: {
+      id: `set-${Date.now()}`,
+      auctionId: input.auctionId,
+      winner: input.winner,
+      amount: input.amount,
+      asset: input.asset,
+      wallet: input.wallet,
+      signature: "awaiting-wallet-signature",
+      status: "pending",
+      network: "Solana devnet",
+      paymentRequest: `solana:${input.wallet}?amount=${input.amount}&label=Auction%20settlement`,
+      verWallet: "pending",
+      verAmount: "pending",
+      confirmations: 0,
+      updatedAt: now(),
+    },
+  })
+  const settlement = toSettlement(row)
+  emit("settlement.created", settlement)
+  return settlement
+}
+
+export async function updateSettlement(id: string, status: Settlement["status"]): Promise<Settlement | null> {
+  try {
+    let extraData: Record<string, unknown> = {}
+    if (status === "verifying") extraData = { verWallet: "matched", verAmount: "matched", confirmations: 1 }
+    if (status === "confirmed") extraData = { signature: `sim-${Date.now().toString(36)}`, network: "Solana mainnet", verWallet: "matched", verAmount: "matched", confirmations: 32 }
+    if (status === "failed") extraData = { verWallet: "mismatch", verAmount: "pending", confirmations: 0 }
+
+    const row = await prisma.settlement.update({
+      where: { id },
+      data: { status, updatedAt: now(), ...extraData },
+    })
+    const settlement = toSettlement(row)
+    emit(`settlement.${status}`, settlement)
+    return settlement
+  } catch {
+    return null
+  }
+}
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+export async function getSettings(): Promise<PrismaSettings> {
+  // Upsert the singleton row so it always exists
+  return prisma.settings.upsert({
+    where: { id: 1 },
+    create: { id: 1, reserveProtection: true, autoExtend: true, humanApproval: false, webChat: true, email: true, sms: false },
+    update: {},
+  })
+}
+
+export async function updateSettings(patch: Partial<Omit<PrismaSettings, "id">>): Promise<PrismaSettings> {
+  const updated = await prisma.settings.upsert({
+    where: { id: 1 },
+    create: { id: 1, reserveProtection: true, autoExtend: true, humanApproval: false, webChat: true, email: true, sms: false, ...patch },
+    update: patch,
+  })
+  emit("settings.updated", updated)
+  return updated
+}
+
+// ─── Policy rules ─────────────────────────────────────────────────────────────
+
+export async function getPolicyRules(auctionId?: string) {
+  return prisma.policyRule.findMany({
+    where: { active: true, ...(auctionId ? { OR: [{ auctionId }, { auctionId: null }] } : {}) },
+    orderBy: { createdAt: "asc" },
+  })
+}
+
+export async function createPolicyRule(input: {
+  auctionId?: string
+  name: string
+  description?: string
+  condition: string
+  action: string
+}) {
+  const row = await prisma.policyRule.create({
+    data: {
+      id: `pol-${Date.now().toString(36)}`,
+      auctionId: input.auctionId ?? null,
+      name: input.name,
+      description: input.description ?? "",
+      condition: input.condition,
+      action: input.action,
+      active: true,
+      createdAt: now(),
+    },
+  })
+  emit("policy.created", row)
+  return row
+}
+
+export async function updatePolicyRule(id: string, patch: { name?: string; description?: string; condition?: string; action?: string; active?: boolean }) {
+  try {
+    const row = await prisma.policyRule.update({ where: { id }, data: patch })
+    emit("policy.updated", row)
+    return row
+  } catch {
+    return null
+  }
+}
+
+export async function deletePolicyRule(id: string) {
+  try {
+    const row = await prisma.policyRule.update({ where: { id }, data: { active: false } })
+    emit("policy.deleted", row)
+    return row
+  } catch {
+    return null
+  }
+}
+
+// ─── Event log ────────────────────────────────────────────────────────────────
+
+export async function getEventLog(auctionId?: string) {
+  return prisma.eventLog.findMany({
+    where: auctionId ? { auctionId } : undefined,
+    orderBy: { at: "desc" },
+    take: 200,
+  })
+}

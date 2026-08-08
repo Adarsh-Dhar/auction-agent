@@ -4,18 +4,30 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && next build",
     "start": "next start",
     "lint": "eslint .",
-    "email-service": "cd email-service && ./start.sh"
+    "email-service": "cd email-service && ./start.sh",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:push": "prisma db push",
+    "db:seed": "tsx lib/seed.ts",
+    "db:studio": "prisma studio",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
+    "@prisma/client": "^5.22.0",
     "@vercel/analytics": "1.6.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.16.0",
     "next": "16.3.0",
+    "openai": "^4.67.0",
+    "prisma": "^5.22.0",
     "react": "^19",
     "react-dom": "^19",
     "shadcn": "^4.8.0",
@@ -27,9 +39,12 @@
     "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitest/coverage-v8": "^2.1.8",
     "postcss": "^8.5",
     "tailwindcss": "^4.3.3",
-    "typescript": "5.7.3"
+    "tsx": "^4.19.2",
+    "typescript": "5.7.3",
+    "vitest": "^2.1.8"
   },
   "pnpm": {
     "overrides": {

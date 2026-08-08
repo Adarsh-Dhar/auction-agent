@@ -2,11 +2,23 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { AlertTriangle, Gavel, KeyRound, LayoutDashboard, Radio, Send, Settings2, Trophy, Users } from 'lucide-react'
+import { AlertTriangle, Clock, Gavel, KeyRound, LayoutDashboard, Radio, Send, Settings2, ShieldCheck, Trophy, Users } from 'lucide-react'
 import type { ReactNode } from 'react'
 
-const workspace = [{ href: '/', label: 'Overview', icon: LayoutDashboard }, { href: '/auctions/live', label: 'Live auctions', icon: Radio }, { href: '/escalations', label: 'Escalations', icon: AlertTriangle }, { href: '/settlements', label: 'Settlements', icon: Trophy }, { href: '/join', label: 'Join an auction', icon: KeyRound }]
-const configure = [{ href: '/settings/bidders', label: 'Bidder roster', icon: Users }, { href: '/settings/rules', label: 'Rules & policies', icon: Settings2 }, { href: '/settings/channels', label: 'Channels', icon: Send }]
+const workspace = [
+  { href: '/', label: 'Overview', icon: LayoutDashboard },
+  { href: '/auctions/live', label: 'Live auctions', icon: Radio },
+  { href: '/escalations', label: 'Escalations', icon: AlertTriangle },
+  { href: '/settlements', label: 'Settlements', icon: Trophy },
+  { href: '/policy', label: 'Policy rules', icon: ShieldCheck },
+  { href: '/events', label: 'Event log', icon: Clock },
+  { href: '/join', label: 'Join an auction', icon: KeyRound },
+]
+const configure = [
+  { href: '/settings/bidders', label: 'Bidder roster', icon: Users },
+  { href: '/settings/rules', label: 'Rules & policies', icon: Settings2 },
+  { href: '/settings/channels', label: 'Channels', icon: Send },
+]
 
 export function AuctionShell({ children, title, eyebrow = 'Auction operations', action }: { children: ReactNode; title: string; eyebrow?: string; action?: ReactNode }) {
   const pathname = usePathname()
