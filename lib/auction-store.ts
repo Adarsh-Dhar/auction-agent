@@ -19,7 +19,7 @@ export type Auction = {
   joinCode: string
 }
 
-export type Bidder = { id: string; name: string; handle: string; status: "active" | "quiet" | "dropped"; lastBid: string; connection: string }
+export type Bidder = { id: string; name: string; handle: string; status: "active" | "quiet" | "dropped"; lastBid: string; connection: string; email?: string }
 export type Message = { id: string; bidderId: string; author: string; body: string; kind: MessageKind; at: string }
 export type Escalation = { id: string; auctionId: string; bidder: string; reason: string; severity: "high" | "medium" | "low"; status: "open" | "resolved"; createdAt: string }
 export type Settlement = { id: string; auctionId: string; winner: string; amount: string; asset: "SOL" | "USDC"; wallet: string; signature: string; status: "pending" | "verifying" | "confirmed" | "failed"; network: "Solana mainnet" | "Solana devnet"; paymentRequest: string; verification: { wallet: "pending" | "matched" | "mismatch"; amount: "pending" | "matched" | "mismatch"; confirmations: number }; updatedAt: string }
@@ -39,6 +39,16 @@ function generateUniqueJoinCode(): string {
   let code = generateJoinCode()
   while (auctions.some((auction) => auction.joinCode === code)) code = generateJoinCode()
   return code
+}
+
+// Currency values are stored as display strings (e.g. "$2,450"); these convert
+// to/from numbers so bids can be compared against the floor and current top bid.
+function parseCurrency(value: string): number {
+  const cleaned = value.replace(/[^0-9.]/g, "")
+  return cleaned ? Number.parseFloat(cleaned) : NaN
+}
+function formatCurrency(value: number): string {
+  return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
 }
 
 const auctions: Auction[] = [
@@ -81,7 +91,7 @@ export type JoinResult =
 
 // A bidder joins an auction by presenting the room code the seller shared with them.
 // This is the gate that stops anyone who doesn't have the code from being added.
-export function joinAuctionByCode(code: string, applicant: { name: string; handle: string; connection: string }): JoinResult {
+export function joinAuctionByCode(code: string, applicant: { name: string; handle: string; connection: string; email?: string }): JoinResult {
   const normalized = code.trim().toUpperCase()
   const auction = auctions.find((entry) => entry.joinCode === normalized)
   if (!auction) return { ok: false, reason: "invalid_code" }
@@ -89,11 +99,57 @@ export function joinAuctionByCode(code: string, applicant: { name: string; handl
   const roster = bidders[auction.id] || (bidders[auction.id] = [])
   const existing = roster.find((entry) => entry.handle.toLowerCase() === applicant.handle.toLowerCase())
   if (existing) return { ok: true, auction, bidder: existing }
-  const bidder: Bidder = { id: `bd-${Date.now().toString(36)}`, name: applicant.name, handle: applicant.handle, status: "active", lastBid: "—", connection: applicant.connection }
+  const bidder: Bidder = { id: `bd-${Date.now().toString(36)}`, name: applicant.name, handle: applicant.handle, status: "active", lastBid: "—", connection: applicant.connection, email: applicant.email }
   roster.push(bidder)
   auction.bidders = roster.length
   emit("bidder.joined", { auctionId: auction.id, bidder })
   return { ok: true, auction, bidder }
+}
+
+// Looks up which auction (if any) an email address has already joined, keyed by
+// the email stored on the bidder record. Used by the email channel to route a
+// reply to "bid"/"status"/question intents without asking for the code again.
+export function findBidderByEmail(email: string): { auction: Auction; bidder: Bidder } | null {
+  const normalized = email.trim().toLowerCase()
+  for (const auction of auctions) {
+    const roster = bidders[auction.id] || []
+    const match = roster.find((entry) => entry.email && entry.email.toLowerCase() === normalized)
+    if (match) return { auction, bidder: match }
+  }
+  return null
+}
+
+export type BidResult =
+  | { ok: true; auction: Auction; bidder: Bidder; outbid: Bidder | null }
+  | { ok: false; reason: "not_found" | "auction_closed" | "invalid_amount" | "below_floor" | "below_top_bid" }
+
+// Places a bid for a bidder already on the roster. Rejects amounts that don't
+// clear the reserve floor or the current top bid, and reports whoever previously
+// held the top bid (if they're a different bidder) so they can be notified.
+export function placeBid(auctionId: string, bidderId: string, rawAmount: string): BidResult {
+  const auction = auctions.find((entry) => entry.id === auctionId)
+  if (!auction) return { ok: false, reason: "not_found" }
+  if (auction.status === "closed") return { ok: false, reason: "auction_closed" }
+  const roster = bidders[auctionId] || []
+  const bidder = roster.find((entry) => entry.id === bidderId)
+  if (!bidder) return { ok: false, reason: "not_found" }
+
+  const amount = parseCurrency(rawAmount)
+  if (Number.isNaN(amount)) return { ok: false, reason: "invalid_amount" }
+
+  const floor = parseCurrency(auction.floor)
+  const topBid = parseCurrency(auction.topBid)
+  if (!Number.isNaN(floor) && amount < floor) return { ok: false, reason: "below_floor" }
+  if (!Number.isNaN(topBid) && amount <= topBid) return { ok: false, reason: "below_top_bid" }
+
+  const previousLeader = roster.find((entry) => entry.id !== bidderId && parseCurrency(entry.lastBid) === topBid) || null
+
+  bidder.lastBid = formatCurrency(amount)
+  bidder.status = "active"
+  auction.topBid = formatCurrency(amount)
+  emit("bid.placed", { auctionId, bidderId: bidder.id, amount: bidder.lastBid })
+
+  return { ok: true, auction, bidder, outbid: previousLeader }
 }
 export function resolveEscalation(id: string) { const item = escalations.find((entry) => entry.id === id); if (item) { item.status = "resolved"; emit("escalation.resolved", item) }; return item }
 export function addMessage(bidderId: string, body: string) { const message: Message = { id: `m-${Date.now()}`, bidderId, author: "Operator", body, kind: "system", at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }; messages[bidderId] = [...(messages[bidderId] || []), message]; emit("message.created", message); return message }

@@ -19,6 +19,7 @@ export async function POST(request: Request) {
     name: String(body.name),
     handle: String(body.handle),
     connection: String(body.connection || "Web chat"),
+    email: body.address ? String(body.address) : undefined,
   })
 
   if (!result.ok) {
