@@ -4,14 +4,14 @@ import { createTestAuction, createTestBidder, createTestMessage } from "@/tests/
 
 describe("getConversationContext", () => {
   it("returns empty array when bidder has no messages", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-empty" })
     const context = await getConversationContext("bd-empty")
     expect(context).toHaveLength(0)
   })
 
   it("returns messages in chronological order (oldest first)", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-mem" })
     // Insert with deliberate ordering via different `at` values
     await createTestMessage("bd-mem", "First message", "question")
@@ -24,7 +24,7 @@ describe("getConversationContext", () => {
   })
 
   it("respects the limit parameter", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-lim" })
     for (let i = 0; i < 8; i++) {
       await createTestMessage("bd-lim", `Message ${i}`, "question")
@@ -34,7 +34,7 @@ describe("getConversationContext", () => {
   })
 
   it("assigns role=user for bidder messages", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-role" })
     const { prisma } = await import("@/lib/db")
     await prisma.message.create({
@@ -45,7 +45,7 @@ describe("getConversationContext", () => {
   })
 
   it("assigns role=assistant for agent and operator messages", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-asst" })
     const { prisma } = await import("@/lib/db")
     await prisma.message.create({
@@ -58,7 +58,7 @@ describe("getConversationContext", () => {
 
 describe("getRecentMessages", () => {
   it("returns Message objects rather than chat turns", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     await createTestBidder("AUC-TEST", { id: "bd-raw" })
     await createTestMessage("bd-raw", "Hello", "question")
     const messages = await getRecentMessages("bd-raw", 6)

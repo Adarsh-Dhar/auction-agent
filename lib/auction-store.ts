@@ -98,6 +98,20 @@ _events.setMaxListeners(100)
 
 const now = () => new Date().toISOString()
 
+// Monotonic per-process counter for EventLog IDs. `at` is only
+// millisecond-precision, so two events created in the same millisecond
+// (easily possible — a single request can fire multiple emit() calls, and
+// SQLite writes are fast) would otherwise be indistinguishable in sort
+// order. Embedding a strictly-increasing, zero-padded sequence in the ID
+// means id-string comparison always matches true creation order, so it can
+// serve as a reliable tiebreaker (see getEventLog's orderBy below) without
+// a schema migration.
+let _eventSeq = 0
+function nextEventId(): string {
+  _eventSeq += 1
+  return `evt-${Date.now()}-${_eventSeq.toString(36).padStart(6, "0")}`
+}
+
 export const auctionStore = {
   /** The EventEmitter used by the SSE stream route. */
   events: _events,
@@ -112,7 +126,7 @@ export function emit(type: string, payload: unknown) {
 export async function logEvent(type: string, payload: unknown, auctionId?: string) {
   await prisma.eventLog.create({
     data: {
-      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: nextEventId(),
       type,
       payload: JSON.stringify(payload),
       at: now(),
@@ -652,7 +666,11 @@ export async function deletePolicyRule(id: string) {
 export async function getEventLog(auctionId?: string) {
   return prisma.eventLog.findMany({
     where: auctionId ? { auctionId } : undefined,
-    orderBy: { at: "desc" },
+    // `at` alone isn't a reliable sort key — two events created in the
+    // same millisecond would tie. `id` embeds a monotonic per-process
+    // sequence (see nextEventId()), so it's a safe deterministic
+    // tiebreaker that always matches true creation order.
+    orderBy: [{ at: "desc" }, { id: "desc" }],
     take: 200,
   })
 }

@@ -26,7 +26,7 @@ describe("GET /api/policy", () => {
   })
 
   it("filters by auctionId when provided", async () => {
-    await createTestAuction()
+    await createTestAuction({ id: "AUC-TEST" })
     const { prisma } = await import("@/lib/db")
     const now = new Date().toISOString()
     await prisma.policyRule.createMany({

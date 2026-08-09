@@ -3,10 +3,20 @@ import { GET as getEvents } from "@/app/api/events/route"
 import { makeRequest, json, createTestAuction } from "@/tests/helpers"
 import { prisma } from "@/lib/db"
 
+// Monotonic counter mirroring lib/auction-store.ts's nextEventId() — a
+// random suffix here would reintroduce the exact tie-ordering bug this
+// file used to hit intermittently when events landed in the same
+// millisecond (very possible with fast, back-to-back SQLite writes).
+let _testEventSeq = 0
+function nextTestEventId(): string {
+  _testEventSeq += 1
+  return `evt-${Date.now()}-${_testEventSeq.toString(36).padStart(6, "0")}`
+}
+
 async function seedEvent(type: string, auctionId: string | null = null) {
   return prisma.eventLog.create({
     data: {
-      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: nextTestEventId(),
       type,
       payload: JSON.stringify({ test: true }),
       at: new Date().toISOString(),
@@ -30,7 +40,10 @@ describe("GET /api/events", () => {
     const data = await json<{ type: string }[]>(res)
     expect(data).toHaveLength(3)
     // newest-first — last inserted should appear first
+    // With monotonic event IDs, this ordering is now deterministic
     expect(data[0].type).toBe("settings.updated")
+    expect(data[1].type).toBe("escalation.created")
+    expect(data[2].type).toBe("bid.placed")
   })
 
   it("filters by auctionId when query param is provided", async () => {
