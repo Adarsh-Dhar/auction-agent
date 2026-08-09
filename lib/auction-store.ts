@@ -434,7 +434,7 @@ export async function placeBid(auctionId: string, bidderId: string, rawAmount: s
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
 export async function getMessages(bidderId: string): Promise<Message[]> {
-  const rows = await prisma.message.findMany({ where: { bidderId }, orderBy: { at: "asc" } })
+  const rows = await prisma.message.findMany({ where: { bidderId }, orderBy: [{ at: "asc" }, { id: "asc" }] })
   return rows.map(toMessage)
 }
 

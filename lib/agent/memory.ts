@@ -27,7 +27,7 @@ export async function getConversationContext(
 ): Promise<ConversationTurn[]> {
   const rows = await prisma.message.findMany({
     where: { bidderId },
-    orderBy: { at: "desc" },
+    orderBy: [{ at: "desc" }, { id: "desc" }],
     take: limit,
   })
 
@@ -47,7 +47,7 @@ export async function getConversationContext(
 export async function getRecentMessages(bidderId: string, limit = 6): Promise<Message[]> {
   const rows = await prisma.message.findMany({
     where: { bidderId },
-    orderBy: { at: "desc" },
+    orderBy: [{ at: "desc" }, { id: "desc" }],
     take: limit,
   })
   return rows.reverse().map((row) => ({
