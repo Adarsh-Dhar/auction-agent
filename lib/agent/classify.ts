@@ -2,7 +2,7 @@
  * lib/agent/classify.ts
  *
  * LLM-based message classifier.  Replaces all regex / substring matching with
- * a structured GPT-4o-mini call that returns JSON.
+ * a structured LLM call that returns JSON.
  *
  * The system prompt explicitly handles:
  *   - Negation:          "not less than 50" → bid of 50
@@ -12,11 +12,44 @@
  *   - Genuine ambiguity: returns confidence < 0.6, decision = escalate
  *
  * The function is designed to be mockable for tests: set
- * process.env.OPENAI_API_KEY = "test" and the mock path is taken in tests.
+ * process.env.OPENAI_API_KEY or process.env.GEMINI_API_KEY to placeholder values
+ * and the heuristic path is taken in tests.
+ *
+ * Provider selection: Automatically picks Gemini or OpenAI based on which API key
+ * is actually set (via environment variables). Both use the same OpenAI SDK since
+ * Gemini exposes an OpenAI-compatible endpoint.
  */
 import OpenAI from "openai"
 import type { Message, MessageKind } from "@/lib/auction-store"
 import type { ConversationTurn } from "@/lib/agent/memory"
+
+// ─── Provider configuration ─────────────────────────────────────────────────────
+
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+function isRealKey(key: string | undefined, placeholder: string): boolean {
+  return !!key && key !== placeholder && key.trim() !== ""
+}
+
+function resolveProvider(): "gemini" | "openai" | "none" {
+  if (isRealKey(process.env.GEMINI_API_KEY, "your-gemini-api-key-here")) return "gemini"
+  if (isRealKey(process.env.OPENAI_API_KEY, "sk-your-openai-api-key-here")) return "openai"
+  return "none"
+}
+
+function buildClient(provider: "gemini" | "openai") {
+  if (provider === "gemini") {
+    return {
+      client: new OpenAI({ apiKey: process.env.GEMINI_API_KEY!, baseURL: GEMINI_BASE_URL }),
+      model: process.env.GEMINI_MODEL || GEMINI_DEFAULT_MODEL,
+    }
+  }
+  return {
+    client: new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }),
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+  }
+}
 
 export type ClassificationResult = {
   /** What kind of message this is */
@@ -81,7 +114,7 @@ Return ONLY valid JSON matching this schema — no markdown, no explanation:
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 /**
- * Classify a single bidder message using GPT-4o-mini.
+ * Classify a single bidder message using LLM (Gemini or OpenAI).
  *
  * @param message       The raw message text from the bidder
  * @param history       Recent conversation turns for context (from memory.ts)
@@ -92,14 +125,14 @@ export async function classifyMessage(
   history: Message[] | ConversationTurn[],
   auctionPolicy: string
 ): Promise<ClassificationResult> {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey || apiKey === "sk-your-openai-api-key-here") {
+  const provider = resolveProvider()
+  if (provider === "none") {
     // No real key — return a best-effort heuristic result so the app still
-    // functions in demo/test environments without an OpenAI account.
+    // functions in demo/test environments without an API key.
     return heuristicFallback(message)
   }
 
-  const client = new OpenAI({ apiKey })
+  const { client, model } = buildClient(provider)
 
   // Convert Message[] or ConversationTurn[] to chat turns
   const contextTurns: OpenAI.Chat.ChatCompletionMessageParam[] = history.map((h) => {
@@ -114,7 +147,7 @@ export async function classifyMessage(
 
   try {
     const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model,
       temperature: 0.1, // Low temp for deterministic classification
       max_tokens: 256,
       messages: [
@@ -128,8 +161,8 @@ export async function classifyMessage(
     const raw = response.choices[0]?.message?.content ?? ""
     return parseClassification(raw)
   } catch (err) {
-    console.error("[classify] OpenAI call failed:", err)
-    return { ...FALLBACK, reasoning: "OpenAI error — defaulting to escalation." }
+    console.error(`[classify] ${provider} call failed:`, err)
+    return { ...FALLBACK, reasoning: `${provider} error — defaulting to escalation.` }
   }
 }
 
@@ -137,7 +170,9 @@ export async function classifyMessage(
 
 function parseClassification(raw: string): ClassificationResult {
   try {
-    const parsed = JSON.parse(raw)
+    // Gemini sometimes wraps JSON in ```json or ``` fences even with response_format set
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim()
+    const parsed = JSON.parse(cleaned)
 
     const kind: MessageKind =
       ["intent", "question", "bid", "system", "risk"].includes(parsed.kind)
@@ -181,11 +216,6 @@ function heuristicFallback(message: string): ClassificationResult {
   const plainNumber = text.match(/^[\d,]+(?:\.\d+)?$/)
   const bidKeyword = lower.match(/\b(?:bid|offer|put me down for|i'll go)\b.*?([\d,]+(?:\.\d+)?)/)
 
-  // Risk / withdrawal signals
-  if (/\b(out|pass|too (?:rich|high|much)|beyond my|can't go|dropping)\b/.test(lower)) {
-    return { kind: "risk", decision: "reject", confidence: 0.8, reasoning: "Bidder signaling withdrawal." }
-  }
-
   // Negation bids: "not less than N", "no lower than N"
   const negBid = lower.match(/(?:not less than|no lower than|at least|minimum of)\s*([\d,]+)/)
   if (negBid) {
@@ -197,10 +227,29 @@ function heuristicFallback(message: string): ClassificationResult {
     return { kind: "intent", decision: "clarify", confidence: 0.75, reasoning: "Relative bid — need concrete amount." }
   }
 
-  // Conditional bid: "N if condition"
-  const condMatch = text.match(/([\d,]+(?:\.\d+)?)\s+if\s+(.+)/i)
+  // Conditional bid: "N if condition" or "I could go to N if condition"
+  const condMatch = text.match(/(?:go to\s+)?([\d,]+(?:\.\d+)?)\s+if\s+(.+)/i)
   if (condMatch) {
     return { kind: "bid", amount: condMatch[1].replace(/,/g, ""), condition: condMatch[2].trim(), decision: "accept", confidence: 0.78, reasoning: "Conditional bid extracted." }
+  }
+
+  // Conditional without concrete amount — escalate (but exclude "higher" variations which are relative bids)
+  if (/\b(?:if|when|provided|assuming)\b/.test(lower) && !dollarMatch && !plainNumber && !bidKeyword && !/\bhigher\b/.test(lower)) {
+    return { kind: "intent", decision: "escalate", confidence: 0.4, reasoning: "Conditional without concrete amount — needs clarification." }
+  }
+
+  // "go higher" conditional without amount → clarify/escalate
+  if (/\bgo higher\b/.test(lower) && /\bif\b/.test(lower) && !dollarMatch && !plainNumber && !bidKeyword) {
+    return { kind: "intent", decision: "escalate", confidence: 0.4, reasoning: "Conditional higher bid without amount — needs clarification." }
+  }
+
+  // Risk / withdrawal signals (check after conditional patterns to avoid false positives)
+  if (/\b(?:i'm out|i'm done|i pass|passing)\b/.test(lower) || 
+      /\btoo (?:rich|high|much|expensive)\b/.test(lower) ||
+      /\bbeyond my\b/.test(lower) ||
+      /\bcan't go\b/.test(lower) ||
+      (/\bthis is\b/.test(lower) && /\btoo (?:rich|high|much)\b/.test(lower))) {
+    return { kind: "risk", decision: "reject", confidence: 0.8, reasoning: "Bidder signaling withdrawal." }
   }
 
   // Direct dollar amount

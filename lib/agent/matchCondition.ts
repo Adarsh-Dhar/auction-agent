@@ -10,8 +10,40 @@
  *
  * This module uses the LLM when an API key is present, and falls back to a
  * token-overlap similarity score when it isn't.
+ *
+ * Provider selection: Automatically picks Gemini or OpenAI based on which API key
+ * is actually set (via environment variables). Both use the same OpenAI SDK since
+ * Gemini exposes an OpenAI-compatible endpoint.
  */
 import OpenAI from "openai"
+
+// ─── Provider configuration (shared with classify.ts) ─────────────────────────────
+
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+function isRealKey(key: string | undefined, placeholder: string): boolean {
+  return !!key && key !== placeholder && key.trim() !== ""
+}
+
+function resolveProvider(): "gemini" | "openai" | "none" {
+  if (isRealKey(process.env.GEMINI_API_KEY, "your-gemini-api-key-here")) return "gemini"
+  if (isRealKey(process.env.OPENAI_API_KEY, "sk-your-openai-api-key-here")) return "openai"
+  return "none"
+}
+
+function buildClient(provider: "gemini" | "openai") {
+  if (provider === "gemini") {
+    return {
+      client: new OpenAI({ apiKey: process.env.GEMINI_API_KEY!, baseURL: GEMINI_BASE_URL }),
+      model: process.env.GEMINI_MODEL || GEMINI_DEFAULT_MODEL,
+    }
+  }
+  return {
+    client: new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }),
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+  }
+}
 
 export type ConditionMatchResult = {
   matched: boolean
@@ -32,12 +64,12 @@ export async function matchCondition(
   conditionName: string,
   context = ""
 ): Promise<ConditionMatchResult> {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey || apiKey === "sk-your-openai-api-key-here") {
+  const provider = resolveProvider()
+  if (provider === "none") {
     return tokenOverlapMatch(message, conditionName)
   }
 
-  const client = new OpenAI({ apiKey })
+  const { client, model } = buildClient(provider)
 
   const prompt = `You are checking whether a bidder's message references a specific auction condition.
 
@@ -57,7 +89,7 @@ Return ONLY valid JSON:
 
   try {
     const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model,
       temperature: 0.1,
       max_tokens: 128,
       messages: [{ role: "user", content: prompt }],
@@ -65,7 +97,9 @@ Return ONLY valid JSON:
     })
 
     const raw = response.choices[0]?.message?.content ?? ""
-    const parsed = JSON.parse(raw)
+    // Clean potential markdown fences (Gemini compatibility)
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim()
+    const parsed = JSON.parse(cleaned)
     return {
       matched: Boolean(parsed.matched),
       confidence: typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5,
@@ -105,7 +139,15 @@ function tokenOverlapMatch(message: string, conditionName: string): ConditionMat
   // Also check for partial containment — if all condition tokens appear in the message
   const allCondTokensPresent = condTokens.size > 0 && [...condTokens].every((t) => msgTokens.has(t))
 
-  const confidence = allCondTokensPresent ? Math.max(score, 0.8) : score
+  // Check for partial word matches (e.g., "ship" matching "ships")
+  const partialMatches = [...condTokens].filter((condToken) => 
+    [...msgTokens].some((msgToken) => 
+      msgToken.includes(condToken) || condToken.includes(msgToken)
+    )
+  )
+  const hasPartialMatches = partialMatches.length >= Math.max(1, condTokens.size * 0.5)
+
+  const confidence = allCondTokensPresent ? Math.max(score, 0.8) : (hasPartialMatches ? Math.max(score, 0.3) : score)
   const matched = confidence >= 0.25
 
   return {

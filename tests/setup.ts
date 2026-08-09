@@ -3,8 +3,8 @@
  *
  * - Swaps DATABASE_URL to a throwaway in-memory SQLite URL so tests never
  *   touch the real dev.db.
- * - Sets a sentinel OPENAI_API_KEY so classify.ts takes the heuristic path
- *   (no real OpenAI calls in the test suite — mocked where needed).
+ * - Sets sentinel API keys so classify.ts takes the heuristic path
+ *   (no real LLM calls in the test suite — mocked where needed).
  * - Runs prisma migrate deploy on the test database before all suites.
  * - Truncates all tables before each individual test for isolation.
  */
@@ -14,8 +14,9 @@ import path from "path"
 
 // Point to a separate test database
 process.env.DATABASE_URL = "file:./test.db"
-// Sentinel value — classify.ts checks for this and uses the heuristic fallback
-process.env.OPENAI_API_KEY = "sk-test-no-real-key"
+// Sentinel values — classify.ts checks for these and uses the heuristic fallback
+process.env.OPENAI_API_KEY = "sk-your-openai-api-key-here"
+process.env.GEMINI_API_KEY = "your-gemini-api-key-here"
 
 beforeAll(async () => {
   // Push the schema to the test DB (fast — no migration history needed for tests)
