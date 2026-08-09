@@ -35,6 +35,10 @@ export async function createTestAuction(overrides: Partial<{
   joinCode: string
   endsAt: string | null
   minIncrement: string
+  lastBidAt: string | null
+  bidWindowSeconds: number
+  extendSeconds: number
+  autoExtend: boolean
 }> = {}) {
   // Generate a unique join code per call to avoid unique-constraint collisions
   // when multiple tests run against the same in-process SQLite connection.
@@ -52,9 +56,12 @@ export async function createTestAuction(overrides: Partial<{
       createdAt: now(),
       terms: overrides.terms ?? "Standard test terms.",
       channels: JSON.stringify(["Web chat"]),
-      autoExtend: true,
+      autoExtend: overrides.autoExtend ?? true,
       requiresApproval: false,
       joinCode: overrides.joinCode ?? defaultCode,
+      lastBidAt: overrides.lastBidAt,
+      bidWindowSeconds: overrides.bidWindowSeconds ?? 300,
+      extendSeconds: overrides.extendSeconds ?? 60,
     },
   })
 }

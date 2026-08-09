@@ -45,7 +45,7 @@ COLOR_MAGENTA = "\033[35m"
 # so it's obvious which checklist row a given log line satisfies.
 STAGE_PATTERNS = [
     (r"Agent email address:", COLOR_GREEN, "[SETUP] mailbox connected"),
-    (r"Webhook server listening", COLOR_GREEN, "[SETUP] webhook up"),
+    (r"Webhook server listening", COLOR_GREEN, "[SETUP] webhook up (notify-resolved + notify-reminder)"),
     (r"Received email from", COLOR_CYAN, "[INBOUND] message received"),
     (r"Duplicate delivery of message .* — skipping", COLOR_YELLOW, "[IDEMPOTENCY] duplicate skipped (row 9)"),
     (r"Handled join", COLOR_GREEN, "[JOIN] (row 1)"),

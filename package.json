@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "email-service": "cd email-service && ./start.sh",
+    "scheduler": "tsx scripts/scheduler.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",

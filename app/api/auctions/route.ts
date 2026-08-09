@@ -21,6 +21,8 @@ export async function POST(request: Request) {
     channels: Array.isArray(body.channels) ? body.channels : ["Web chat"],
     autoExtend: body.autoExtend ?? true,
     requiresApproval: body.requiresApproval ?? false,
+    bidWindowSeconds: typeof body.bidWindowSeconds === "number" ? body.bidWindowSeconds : undefined,
+    extendSeconds: typeof body.extendSeconds === "number" ? body.extendSeconds : undefined,
   })
   return NextResponse.json(auction, { status: 201 })
 }

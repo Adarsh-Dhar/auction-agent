@@ -23,6 +23,16 @@ model Auction {
   requiresApproval Boolean     @default(false)
   joinCode         String      @unique
 
+  // ── Bidding-round timer ──────────────────────────────────────────────────
+  // lastBidAt anchors the current round's deadline: deadline = lastBidAt (or
+  // createdAt if no bid yet) + bidWindowSeconds. Every successful bid resets
+  // lastBidAt, which pushes the deadline out — this is what "the next bid
+  // has to happen within X of the last one" means in practice, without a
+  // separate timer-state column that could drift out of sync with bids.
+  lastBidAt        String?
+  bidWindowSeconds Int         @default(300)
+  extendSeconds    Int         @default(60)
+
   bidderRows    Bidder[]
   escalations   Escalation[]
   settlements   Settlement[]
@@ -109,6 +119,21 @@ model PolicyRule {
   createdAt   String
 
   auction     Auction? @relation(fields: [auctionId], references: [id])
+}
+
+// One row per (auction, bidding-round, reminder tier) — prevents the
+// scheduler from re-sending the same reminder on every poll tick. cycleKey
+// is the auction's lastBidAt (or createdAt) at the moment the tier fired, so
+// a new bid — which changes lastBidAt — naturally starts a fresh cycle
+// without any cleanup needed on old rows.
+model ReminderSent {
+  id        String @id
+  auctionId String
+  cycleKey  String
+  tier      String
+  sentAt    String
+
+  @@unique([auctionId, cycleKey, tier])
 }
 
 model EventLog {

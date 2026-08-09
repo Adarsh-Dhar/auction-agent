@@ -39,6 +39,10 @@ export type Auction = {
   autoExtend: boolean
   requiresApproval: boolean
   joinCode: string
+  lastBidAt: string | null
+  bidWindowSeconds: number
+  extendSeconds: number
+  deadline?: number
 }
 
 export type Bidder = {
@@ -169,6 +173,9 @@ function toAuction(row: PrismaAuction): Auction {
     autoExtend: row.autoExtend,
     requiresApproval: row.requiresApproval,
     joinCode: row.joinCode,
+    lastBidAt: row.lastBidAt,
+    bidWindowSeconds: row.bidWindowSeconds,
+    extendSeconds: row.extendSeconds,
   }
 }
 
@@ -287,7 +294,12 @@ export async function getAuction(id: string): Promise<Auction | null> {
 }
 
 export async function createAuction(
-  input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode"> & { minIncrement?: string; endsAt?: string | null }
+  input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode" | "lastBidAt" | "bidWindowSeconds" | "extendSeconds"> & {
+    minIncrement?: string
+    endsAt?: string | null
+    bidWindowSeconds?: number
+    extendSeconds?: number
+  }
 ): Promise<Auction> {
   // Generate a sequential-style ID based on current count
   const count = await prisma.auction.count()
@@ -310,6 +322,10 @@ export async function createAuction(
       joinCode,
       bidders: 0,
       topBid: "$0",
+      // lastBidAt stays null until the first bid — the round timer falls
+      // back to createdAt in the meantime (see computeAuctionDeadline).
+      bidWindowSeconds: input.bidWindowSeconds ?? 300,
+      extendSeconds: input.extendSeconds ?? 60,
     },
   })
 
@@ -473,9 +489,13 @@ export async function placeBid(auctionId: string, bidderId: string, rawAmount: s
   }
 
   const formatted = formatCurrency(amount)
+  const bidAt = now()
   const [updatedBidder, updatedAuction] = await prisma.$transaction([
     prisma.bidder.update({ where: { id: bidderId }, data: { lastBid: formatted, status: "active" } }),
-    prisma.auction.update({ where: { id: auctionId }, data: { topBid: formatted } }),
+    // lastBidAt reset here is what starts the next bidding-round clock —
+    // the scheduler (scripts/scheduler.ts) reads this to compute each
+    // auction's deadline. See computeAuctionDeadline().
+    prisma.auction.update({ where: { id: auctionId }, data: { topBid: formatted, lastBidAt: bidAt } }),
   ])
 
   const auction = toAuction(updatedAuction)
@@ -483,6 +503,120 @@ export async function placeBid(auctionId: string, bidderId: string, rawAmount: s
 
   emit("bid.placed", { auctionId, bidderId: bidder.id, amount: bidder.lastBid })
   return { ok: true, auction, bidder, outbid }
+}
+
+// ─── Bidding-round timer (used by scripts/scheduler.ts) ───────────────────────
+//
+// The round timer is derived, not stored: deadline = lastBidAt (or createdAt
+// if no bid has landed yet) + bidWindowSeconds. This keeps a single source of
+// truth (lastBidAt, set inside placeBid) instead of a second timestamp that
+// could drift out of sync with actual bid activity.
+
+/** Deadline (ms epoch) for the current bidding round. */
+export function computeAuctionDeadline(auction: Auction): number {
+  const anchor = auction.lastBidAt ?? auction.createdAt
+  const anchorMs = Date.parse(anchor)
+  const base = Number.isNaN(anchorMs) ? Date.now() : anchorMs
+  return base + auction.bidWindowSeconds * 1000
+}
+
+/** Auctions the scheduler needs to evaluate this tick. */
+export async function getLiveAuctionsForTimer(): Promise<Auction[]> {
+  const rows = await prisma.auction.findMany({ where: { status: "live" } })
+  return rows.map(toAuction)
+}
+
+/** Current top bidder, i.e. whoever's lastBid matches the auction's topBid. */
+export async function getAuctionLeader(auctionId: string): Promise<Bidder | null> {
+  const auctionRow = await prisma.auction.findUnique({ where: { id: auctionId } })
+  if (!auctionRow || auctionRow.topBid === "$0") return null
+  const row = await prisma.bidder.findFirst({
+    where: { auctionId, lastBid: auctionRow.topBid },
+  })
+  return row ? toBidder(row) : null
+}
+
+/**
+ * cycleKey identifies the current bidding round for dedup purposes — it's
+ * just lastBidAt (or createdAt as fallback), so a new bid automatically
+ * starts a fresh cycle and old reminder rows become irrelevant without
+ * needing cleanup.
+ */
+export function currentCycleKey(auction: Auction): string {
+  return auction.lastBidAt ?? auction.createdAt
+}
+
+export async function hasReminderBeenSent(auctionId: string, cycleKey: string, tier: string): Promise<boolean> {
+  const row = await prisma.reminderSent.findUnique({
+    where: { auctionId_cycleKey_tier: { auctionId, cycleKey, tier } },
+  })
+  return row !== null
+}
+
+export async function recordReminderSent(auctionId: string, cycleKey: string, tier: string): Promise<void> {
+  // Unique constraint on (auctionId, cycleKey, tier) makes this safe against
+  // a race where two scheduler ticks overlap — the loser just fails quietly.
+  await prisma.reminderSent
+    .create({
+      data: { id: `rem-${Date.now().toString(36)}-${tier}`, auctionId, cycleKey, tier, sentAt: now() },
+    })
+    .catch(() => {})
+}
+
+/**
+ * Grants one grace extension for the current round: pushes the deadline out
+ * to now + extendSeconds by moving lastBidAt back that far. Only meant to be
+ * called once per cycle (the scheduler dedups via the "extended" reminder
+ * tier) — this is the auto-extend behavior the `autoExtend` toggle now
+ * actually drives.
+ */
+export async function extendAuctionRound(auctionId: string): Promise<Auction | null> {
+  try {
+    const auctionRow = await prisma.auction.findUnique({ where: { id: auctionId } })
+    if (!auctionRow) return null
+    const newAnchor = new Date(Date.now() - (auctionRow.bidWindowSeconds - auctionRow.extendSeconds) * 1000).toISOString()
+    const row = await prisma.auction.update({ where: { id: auctionId }, data: { lastBidAt: newAnchor } })
+    const auction = toAuction(row)
+    emit("auction.extended", { auctionId, extendSeconds: auctionRow.extendSeconds })
+    return auction
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Closes an auction whose round deadline expired with no bid (and either
+ * autoExtend is off, or the one grace extension was already used). If there
+ * was a top bid, hands off into the existing settlement flow for the leader
+ * — mirrors what an operator manually closing + settling would do.
+ */
+export async function closeAuctionByTimer(auctionId: string): Promise<Auction | null> {
+  try {
+    const row = await prisma.auction.update({ where: { id: auctionId }, data: { status: "closed" } })
+    const auction = toAuction(row)
+    emit("auction.closed", { auctionId, reason: "timer" })
+
+    if (auction.topBid !== "$0") {
+      const leader = await getAuctionLeader(auctionId)
+      if (leader) {
+        // wallet is empty — Bidder has no wallet field today; the operator
+        // fills this in from the settlements UI before the payment request
+        // is actually usable. This just opens the settlement record so the
+        // close event doesn't require a manual "create settlement" step.
+        await createSettlement({
+          auctionId,
+          winner: leader.name,
+          amount: auction.topBid,
+          asset: "SOL",
+          wallet: "",
+        })
+      }
+    }
+
+    return auction
+  } catch {
+    return null
+  }
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────

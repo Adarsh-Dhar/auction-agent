@@ -16,6 +16,8 @@ import re
 import threading
 import collections
 import requests
+import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
 from caspian_sdk import CommClient
@@ -127,9 +129,9 @@ def parse_intent(text: str) -> dict:
     return {"type": "agent", "text": stripped}
 
 
-def _post_with_retry(url: str, json_body: dict, timeout: float = 15, retries: int = 1):
+def _post_with_retry(url: str, json_body: dict, timeout: float = 15, retries: int = 2, backoff: float = 1.0):
     """
-    POST with one retry on transient network failures (connection errors,
+    POST with multiple retries on transient network failures (connection errors,
     timeouts). Does NOT retry on a successful response with a non-2xx status
     (e.g. 404, 409) — those are real answers from the API, not transient
     failures, and retrying them wouldn't change the outcome.
@@ -144,11 +146,13 @@ def _post_with_retry(url: str, json_body: dict, timeout: float = 15, retries: in
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
             if attempt < retries:
-                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying")
+                wait_time = backoff * (2 ** attempt)
+                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying in {wait_time:.1f}s")
+                time.sleep(wait_time)
     raise last_exc
 
 
-def _get_with_retry(url: str, params: dict | None = None, timeout: float = 15, retries: int = 1):
+def _get_with_retry(url: str, params: dict | None = None, timeout: float = 15, retries: int = 2, backoff: float = 1.0):
     """GET counterpart to _post_with_retry — see its docstring."""
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
@@ -157,7 +161,9 @@ def _get_with_retry(url: str, params: dict | None = None, timeout: float = 15, r
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
             if attempt < retries:
-                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying")
+                wait_time = backoff * (2 ** attempt)
+                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying in {wait_time:.1f}s")
+                time.sleep(wait_time)
     raise last_exc
 
 
@@ -167,7 +173,9 @@ def lookup_bidder_by_email(email: str):
         response = _get_with_retry(
             f"{NEXTJS_API_URL}/api/bidders/lookup",
             params={"email": email},
-            timeout=15,
+            timeout=20,
+            retries=3,
+            backoff=1.5,
         )
         if response.status_code == 200:
             return response.json()
@@ -182,7 +190,9 @@ def join_auction_via_api(code: str, name: str, handle: str, address: str, connec
         response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/auctions/join",
             json_body={"code": code, "name": name, "handle": handle, "connection": connection, "address": address},
-            timeout=15,
+            timeout=20,
+            retries=3,
+            backoff=1.5,
         )
         if response.status_code == 201:
             return response.json()
@@ -200,7 +210,7 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
     negation, and ambiguous phrasing never got judged, they just silently
     misfired. Passing raw text keeps email and web chat at parity.
 
-    One retry is attempted on transient connection/timeout failures before
+    Multiple retries are attempted on transient connection/timeout failures before
     giving up — a brief blip shouldn't cost a bidder their bid and make them
     re-send by hand.
 
@@ -217,7 +227,9 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
         response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/auctions/{auction_id}/bid",
             json_body={"bidderId": bidder_id, "rawMessage": raw_message},
-            timeout=15,
+            timeout=20,  # Increased timeout for better resilience
+            retries=3,   # More retries for transient failures
+            backoff=1.5, # Longer backoff between retries
         )
     except Exception as e:
         return {"outcome": "error", "error": f"API request failed: {str(e)}"}
@@ -252,9 +264,29 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
 
 def get_auction_status(auction_id: str):
     try:
-        response = _get_with_retry(f"{NEXTJS_API_URL}/api/auctions/{auction_id}", timeout=15)
+        response = _get_with_retry(
+            f"{NEXTJS_API_URL}/api/auctions/{auction_id}",
+            timeout=20,
+            retries=3,
+            backoff=1.5,
+        )
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            # Calculate time remaining from deadline
+            auction = data.get("auction", {})
+            deadline = auction.get("deadline")
+            if deadline:
+                now = datetime.now(timezone.utc)
+                deadline_dt = datetime.fromtimestamp(deadline / 1000, timezone.utc)
+                time_remaining = deadline_dt - now
+                
+                if time_remaining.total_seconds() > 0:
+                    minutes = int(time_remaining.total_seconds() // 60)
+                    seconds = int(time_remaining.total_seconds() % 60)
+                    auction["deadline"] = f"{minutes}m {seconds}s"
+                else:
+                    auction["deadline"] = "Closing soon"
+            return data
         return None
     except Exception as e:
         print(f"Status fetch failed: {e}")
@@ -273,7 +305,9 @@ def post_question_via_api(bidder_id: str, text: str) -> dict:
         response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/bidders/{bidder_id}",
             json_body={"body": text},
-            timeout=15,
+            timeout=20,
+            retries=3,
+            backoff=1.5,
         )
         if response.status_code == 201:
             return response.json()
@@ -282,7 +316,7 @@ def post_question_via_api(bidder_id: str, text: str) -> dict:
         return {"error": f"API request failed: {str(e)}"}
 
 
-def notify_outbid(client: CommClient, outbid_bidder: dict, auction_title: str, new_top_bid: str):
+def notify_outbid(client: CommClient, outbid_bidder: dict, auction_title: str, new_top_bid: str, auction_id: str):
     """
     Best-effort outbid notice, sent cold (not as a reply to an inbound message)
     via client.initiate(). Caspian's docs explicitly confirm initiate() for
@@ -294,12 +328,23 @@ def notify_outbid(client: CommClient, outbid_bidder: dict, auction_title: str, n
     address = outbid_bidder.get("email")
     if not address or not EMAIL_CONNECTION_ID:
         return
+    
+    # Fetch auction data to get deadline information
+    auction_data = get_auction_status(auction_id)
+    time_left_msg = ""
+    if auction_data:
+        auction = auction_data.get("auction", {})
+        deadline = auction.get("deadline")
+        if deadline:
+            time_left_msg = f" Time left: {deadline}."
+    
     try:
         client.initiate(
             EMAIL_CONNECTION_ID,
             address,
             f"You've been outbid on \"{auction_title}\". "
-            f"The new top bid is {new_top_bid}. Reply and let us know what you'd like to offer to get back in.",
+            f"The new top bid is {new_top_bid}.{time_left_msg} "
+            f"Reply and let us know what you'd like to offer to get back in.",
         )
         print(f"Sent outbid notice to {address}")
     except Exception as e:
@@ -435,12 +480,13 @@ def handle_message(message, client: CommClient):
             message.reply("Couldn't fetch the auction status right now — try again shortly.")
             return
         a = status["auction"]
+        deadline_msg = f"Time left: {a.get('deadline', 'Unknown')}\n" if a.get('deadline') else ""
         reply = (
             f"📊 Status for \"{a['title']}\"\n\n"
             f"Top bid: {a['topBid']}\n"
             f"Floor: {a['floor']}\n"
             f"Bidders: {a['bidders']}\n"
-            f"Ends: {a['endsAt']}\n"
+            f"{deadline_msg}"
             f"Your last bid: {bidder.get('lastBid', '—')}"
         )
         message.reply(reply)
@@ -465,7 +511,7 @@ def handle_message(message, client: CommClient):
         )
         outbid = result.get("outbid")
         if outbid:
-            notify_outbid(client, outbid, new_auction.get("title", "the auction"), new_auction.get("topBid", ""))
+            notify_outbid(client, outbid, new_auction.get("title", "the auction"), new_auction.get("topBid", ""), auction["id"])
         message.reply(reply)
         print(f"[{conversation_id}] Handled bid (classified)")
         return
@@ -562,9 +608,64 @@ def handle_notify_resolved():
     return jsonify({"ok": True})
 
 
+@_webhook_app.route("/notify-reminder", methods=["POST"])
+def handle_notify_reminder():
+    """
+    POST /notify-reminder  body: { "bidderId": str, "note": str }
+
+    Called fire-and-forget by scripts/scheduler.ts as bidding-round deadlines
+    approach (and on extend/close). Same dispatch path as
+    /notify-resolved — reuses notify_escalation_resolved's channel checks
+    (email connection only, requires bidder.email + EMAIL_CONNECTION_ID)
+    even though this isn't an escalation resolution; the function just sends
+    an arbitrary note over email, so the name is a little narrow but the
+    behavior is exactly what's needed here too.
+    """
+    global _client
+    data = flask_request.get_json(silent=True) or {}
+    bidder_id = data.get("bidderId", "")
+    note = data.get("note", "")
+
+    if not bidder_id or not note:
+        return jsonify({"error": "bidderId and note are required"}), 400
+
+    if _client is None:
+        return jsonify({"error": "email client not initialised yet"}), 503
+
+    notify_escalation_resolved(_client, bidder_id, note)
+    return jsonify({"ok": True})
+
+
 def _start_webhook_server():
     """Start the Flask webhook server in a daemon thread."""
     _webhook_app.run(host="127.0.0.1", port=WEBHOOK_PORT, use_reloader=False, threaded=True)
+
+
+def _listen_with_recovery(client: CommClient, max_retries: int = 5, initial_backoff: float = 2.0):
+    """
+    Wrap client.listen() with recovery logic for transient gateway failures.
+    The Caspian SDK already has internal retry logic, but this adds an outer
+    layer of protection for persistent connectivity issues.
+    """
+    retry_count = 0
+    while retry_count <= max_retries:
+        try:
+            client.listen()
+            # If listen() returns normally, the service was intentionally stopped
+            return
+        except KeyboardInterrupt:
+            print("\n⏹️  Shutting down...")
+            return
+        except Exception as e:
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"❌ Max retries ({max_retries}) exceeded. Giving up.")
+                raise
+            
+            backoff = initial_backoff * (2 ** (retry_count - 1))
+            print(f"⚠️  Gateway error (attempt {retry_count}/{max_retries}): {e}")
+            print(f"   Retrying in {backoff:.1f}s...")
+            time.sleep(backoff)
 
 
 def main():
@@ -596,20 +697,14 @@ def main():
     # operator resolves an escalation with a note.
     webhook_thread = threading.Thread(target=_start_webhook_server, daemon=True)
     webhook_thread.start()
-    print(f"🔔 Webhook server listening on http://127.0.0.1:{WEBHOOK_PORT}/notify-resolved")
+    print(f"🔔 Webhook server listening on http://127.0.0.1:{WEBHOOK_PORT}/notify-resolved and /notify-reminder")
 
     # Register message handler (bound to the client so it can send outbid notices)
     client.on_message(lambda message: handle_message(message, client))
 
-    # Start listening (blocking call)
+    # Start listening (blocking call with recovery)
     print("🎧 Listening for incoming emails...")
-    try:
-        client.listen()
-    except KeyboardInterrupt:
-        print("\n⏹️  Shutting down...")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        raise
+    _listen_with_recovery(client)
 
 
 if __name__ == "__main__":

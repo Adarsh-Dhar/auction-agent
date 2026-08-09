@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { getAuction, getBiddersForAuction, rotateJoinCode } from "@/lib/auction-store"
+import { getAuction, getBiddersForAuction, rotateJoinCode, computeAuctionDeadline } from "@/lib/auction-store"
 
 export async function GET(
   _: Request,
@@ -11,7 +11,12 @@ export async function GET(
     getBiddersForAuction(auctionId),
   ])
   if (!auction) return NextResponse.json({ error: "Auction not found" }, { status: 404 })
-  return NextResponse.json({ auction, bidders })
+  
+  // Add deadline information to the auction response
+  const deadline = computeAuctionDeadline(auction)
+  const auctionWithDeadline = { ...auction, deadline }
+  
+  return NextResponse.json({ auction: auctionWithDeadline, bidders })
 }
 
 // PATCH body: { "action": "rotateCode" }

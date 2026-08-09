@@ -26,6 +26,7 @@ beforeEach(async () => {
   const { prisma } = await import("@/lib/db")
   // Delete in dependency order (FK constraints)
   await prisma.eventLog.deleteMany()
+  await prisma.reminderSent.deleteMany() // no enforced FK, same as eventLog
   await prisma.message.deleteMany()
   await prisma.escalation.deleteMany()
   await prisma.settlement.deleteMany()
