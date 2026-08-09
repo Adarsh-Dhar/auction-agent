@@ -14,6 +14,7 @@ notes back to bidders over email.
 import os
 import re
 import threading
+import collections
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request, jsonify
@@ -38,6 +39,35 @@ EMAIL_CONNECTION_ID = None
 
 # CommClient instance — set in main() so webhook handler can use it.
 _client: CommClient | None = None
+
+# ─── Idempotency guard ──────────────────────────────────────────────────────
+# Caspian (or any webhook-based delivery) can redeliver the same inbound
+# message on retry. Without a dedup check, a redelivered "bid 500" email
+# would be processed twice and could place the same bid twice. We track
+# recently-seen message IDs in memory, bounded so this doesn't grow forever
+# in a long-running process. This is best-effort (resets on restart, not
+# shared across multiple service instances) — a persistent store would be
+# needed for stronger guarantees, but this covers the common case of a
+# single-instance service handling a delivery retry.
+_SEEN_MESSAGE_IDS_MAX = 2000
+_seen_message_ids: collections.OrderedDict = collections.OrderedDict()
+
+
+def _already_processed(message_id: str) -> bool:
+    """
+    Returns True (and does nothing else) if this message ID was already
+    handled. Otherwise records it and returns False. Bounded FIFO eviction
+    keeps memory flat over a long-running process.
+    """
+    if not message_id:
+        # No ID available — can't dedup, so don't block processing.
+        return False
+    if message_id in _seen_message_ids:
+        return True
+    _seen_message_ids[message_id] = None
+    if len(_seen_message_ids) > _SEEN_MESSAGE_IDS_MAX:
+        _seen_message_ids.popitem(last=False)
+    return False
 
 
 def strip_quoted_reply(text: str) -> str:
@@ -97,13 +127,47 @@ def parse_intent(text: str) -> dict:
     return {"type": "agent", "text": stripped}
 
 
+def _post_with_retry(url: str, json_body: dict, timeout: float = 15, retries: int = 1):
+    """
+    POST with one retry on transient network failures (connection errors,
+    timeouts). Does NOT retry on a successful response with a non-2xx status
+    (e.g. 404, 409) — those are real answers from the API, not transient
+    failures, and retrying them wouldn't change the outcome.
+
+    Returns the requests.Response on success, or raises the last exception
+    if all attempts fail (caller is expected to catch it).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return requests.post(url, json=json_body, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            if attempt < retries:
+                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying")
+    raise last_exc
+
+
+def _get_with_retry(url: str, params: dict | None = None, timeout: float = 15, retries: int = 1):
+    """GET counterpart to _post_with_retry — see its docstring."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            if attempt < retries:
+                print(f"Transient failure calling {url} (attempt {attempt + 1}/{retries + 1}): {e} — retrying")
+    raise last_exc
+
+
 def lookup_bidder_by_email(email: str):
     """Find which auction/bidder record this sender already belongs to."""
     try:
-        response = requests.get(
+        response = _get_with_retry(
             f"{NEXTJS_API_URL}/api/bidders/lookup",
             params={"email": email},
-            timeout=10,
+            timeout=15,
         )
         if response.status_code == 200:
             return response.json()
@@ -115,10 +179,10 @@ def lookup_bidder_by_email(email: str):
 
 def join_auction_via_api(code: str, name: str, handle: str, address: str, connection: str = "Email") -> dict:
     try:
-        response = requests.post(
+        response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/auctions/join",
-            json={"code": code, "name": name, "handle": handle, "connection": connection, "address": address},
-            timeout=10,
+            json_body={"code": code, "name": name, "handle": handle, "connection": connection, "address": address},
+            timeout=15,
         )
         if response.status_code == 201:
             return response.json()
@@ -130,23 +194,27 @@ def join_auction_via_api(code: str, name: str, handle: str, address: str, connec
 def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: str) -> dict:
     """
     Send the bidder's raw text to the SAME LLM classification path the web
-    chat channel uses — POST /api/auctions/:auctionId/bid with `rawMessage` 
+    chat channel uses — POST /api/auctions/:auctionId/bid with `rawMessage`
     and no `amount`. This is deliberate: sending a pre-extracted amount
     (the old behaviour) skips classify.ts entirely, so conditional bids,
     negation, and ambiguous phrasing never got judged, they just silently
     misfired. Passing raw text keeps email and web chat at parity.
+
+    One retry is attempted on transient connection/timeout failures before
+    giving up — a brief blip shouldn't cost a bidder their bid and make them
+    re-send by hand.
 
     Returns the raw JSON body plus an HTTP status-derived `outcome` field:
       - "placed"        → 200, no needsEscalation/needsClarification flags, bid went through
       - "escalated"      → 202, classification.decision was "escalate" or low-confidence
       - "clarify"        → 200, classification.decision was "clarify"
       - "not_a_bid"      → 200, classification ran but this wasn't a bid (log as question)
-      - "error"          → request failed or non-2xx status
+      - "error"          → request failed (after retry) or non-2xx status
     """
     try:
-        response = requests.post(
+        response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/auctions/{auction_id}/bid",
-            json={"bidderId": bidder_id, "rawMessage": raw_message},
+            json_body={"bidderId": bidder_id, "rawMessage": raw_message},
             timeout=15,
         )
     except Exception as e:
@@ -172,7 +240,7 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
 
 def get_auction_status(auction_id: str):
     try:
-        response = requests.get(f"{NEXTJS_API_URL}/api/auctions/{auction_id}", timeout=10)
+        response = _get_with_retry(f"{NEXTJS_API_URL}/api/auctions/{auction_id}", timeout=15)
         if response.status_code == 200:
             return response.json()
         return None
@@ -190,10 +258,10 @@ def post_question_via_api(bidder_id: str, text: str) -> dict:
     runs everything through the LLM classifier first.
     """
     try:
-        response = requests.post(
+        response = _post_with_retry(
             f"{NEXTJS_API_URL}/api/bidders/{bidder_id}",
-            json={"body": text},
-            timeout=10,
+            json_body={"body": text},
+            timeout=15,
         )
         if response.status_code == 201:
             return response.json()
@@ -219,7 +287,7 @@ def notify_outbid(client: CommClient, outbid_bidder: dict, auction_title: str, n
             EMAIL_CONNECTION_ID,
             address,
             f"You've been outbid on \"{auction_title}\". "
-            f"The new top bid is {new_top_bid}. Reply with \"bid <amount>\" to get back in.",
+            f"The new top bid is {new_top_bid}. Reply and let us know what you'd like to offer to get back in.",
         )
         print(f"Sent outbid notice to {address}")
     except Exception as e:
@@ -229,9 +297,9 @@ def notify_outbid(client: CommClient, outbid_bidder: dict, auction_title: str, n
 def fetch_bidder_by_id(bidder_id: str) -> dict | None:
     """Look up a bidder record from the Next.js API by their internal ID."""
     try:
-        response = requests.get(
+        response = _get_with_retry(
             f"{NEXTJS_API_URL}/api/bidders/{bidder_id}",
-            timeout=10,
+            timeout=15,
         )
         if response.status_code == 200:
             return response.json().get("bidder")
@@ -290,13 +358,25 @@ def handle_message(message, client: CommClient):
 
     Quoted reply history is stripped first so an old bid/question further
     down a thread doesn't get re-classified alongside the new message.
+
+    Sender identity note: caspian_sdk's Message dataclass (as of the version
+    pinned in requirements.txt) exposes no verification signal — no
+    SPF/DKIM-pass flag, no verified-sender field, nothing to check here.
+    `message.sender` is trusted as-is. This was investigated (not just
+    assumed) and there is currently no mitigation available at this layer;
+    see the "Known Limitations" section in email-service/README.md.
     """
     sender = message.sender
     if isinstance(sender, dict):
         sender = sender.get('address', 'unknown@example.com')
 
-    text = strip_quoted_reply(message.text)
     conversation_id = message.conversation_id
+    message_id = getattr(message, "id", None)
+    if _already_processed(message_id):
+        print(f"[{conversation_id}] Duplicate delivery of message {message_id} — skipping")
+        return
+
+    text = strip_quoted_reply(message.text)
 
     print(f"[{conversation_id}] Received email from {sender}: {text[:100]}...")
 
@@ -316,7 +396,8 @@ def handle_message(message, client: CommClient):
                 f"Auction: {auction.get('title', 'Unknown')}\n"
                 f"Your handle: {bidder.get('handle', email_handle)}\n"
                 f"Your ID: {bidder.get('id', 'Unknown')}\n\n"
-                f"To bid, reply with \"bid <amount>\" (e.g. \"bid 2500\"). "
+                f"Just reply and say what you'd like to offer — plain language is fine "
+                f"(e.g. \"bid 2500\" or \"I can do 2500 if it ships by Friday\"). "
                 f"Send \"status\" any time for an update."
             )
         message.reply(reply)

@@ -175,10 +175,16 @@ Modify the `handle_message()` function to customize reply formatting.
 - **Sender identity is trusted as-is.** `handle_message` treats whatever
   address Caspian reports as `message.sender` as that bidder's verified
   identity — there's no SPF/DKIM check or Caspian-side auth step on top of
-  it. Fine for an MVP/demo; anyone who can send mail as a given address can
-  act as that bidder. Proper verification is out of scope for now and would
-  need to happen either in Caspian itself or as an added check here before
-  production use with real money.
+  it. This was checked, not just assumed: `caspian_sdk`'s `Message` dataclass
+  (see `caspian_sdk/client.py` in the installed package) exposes `id`,
+  `conversation_id`, `connection_id`, `customer_id`, `agent_id`, `channel`,
+  `sender`, `subject`, `text`, `html`, and `media` — no verification-related
+  field of any kind. There is currently nothing to check at this layer.
+  Fine for an MVP/demo; anyone who can send mail as a given address can act
+  as that bidder. Proper verification would need to happen either in
+  Caspian itself (ask them if a future SDK version exposes SPF/DKIM
+  results) or via a separate mail-auth check before production use with
+  real money.
 
 ## Production Deployment
 
