@@ -17,3 +17,8 @@ node_modules
 .DS_Store
 tsconfig.tsbuildinfo
 __pycache__/
+
+# Live verification logs may contain real bidder email addresses / message
+# content captured while running docs/inbound-delivery-verification.md —
+# never commit these.
+email-service/verification-logs/

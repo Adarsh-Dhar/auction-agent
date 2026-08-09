@@ -45,6 +45,12 @@ pip install -r requirements.txt
 ./start.sh
 ```
 
+Or with the log watcher (recommended for live verification):
+
+```bash
+python3 watch_email_service.py
+```
+
 Or manually:
 
 ```bash
@@ -102,6 +108,31 @@ curl -s -X POST https://api.trycaspianai.com/v1/test-emails \
 ```
 
 This will send a test email to your agent. Check the service logs to see the message being processed.
+
+### Full Live Verification (real mailbox round-trip)
+
+The test-email API above only proves basic connectivity via Caspian's
+synthetic path — it is not proof that a real external email round-trips
+through the full pipeline. For that, follow
+[`docs/inbound-delivery-verification.md`](../docs/inbound-delivery-verification.md),
+which walks through a 9-row test matrix (join, bid, escalation, clarify,
+outbid notice, escalation-resolve notification, quoted-reply handling,
+duplicate-delivery handling) against a real inbox, with an evidence
+checklist for each row.
+
+To make that pass easier to follow, run the service through the included
+log watcher instead of `./start.sh` directly:
+
+```bash
+cd email-service
+python3 watch_email_service.py
+```
+
+It highlights each pipeline stage as it happens (received → classified →
+replied/escalated/clarified → notified) and saves a timestamped log under
+`email-service/verification-logs/` that you can attach as evidence for
+each checklist row. Note: this directory is gitignored to avoid committing
+real bidder email addresses captured during verification.
 
 ## Architecture
 
