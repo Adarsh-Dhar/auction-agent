@@ -31,7 +31,8 @@ export type Auction = {
   bidders: number
   topBid: string
   floor: string
-  endsAt: string
+  endsAt: string | null
+  minIncrement: string
   createdAt: string
   terms: string
   channels: string[]
@@ -161,6 +162,7 @@ function toAuction(row: PrismaAuction): Auction {
     topBid: row.topBid,
     floor: row.floor,
     endsAt: row.endsAt,
+    minIncrement: row.minIncrement,
     createdAt: row.createdAt,
     terms: row.terms,
     channels,
@@ -248,12 +250,28 @@ async function generateUniqueJoinCode(): Promise<string> {
 // ─── Currency helpers ─────────────────────────────────────────────────────────
 
 export function parseCurrency(value: string): number {
+  if (!value) return NaN
   const cleaned = value.replace(/[^0-9.]/g, "")
   return cleaned ? Number.parseFloat(cleaned) : NaN
 }
 
+export function roundCurrency(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
 export function formatCurrency(value: number): string {
-  return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+export function calculateDefaultMinIncrement(floor: string): string {
+  if (!floor) return "$1"
+  const isNegative = floor.trim().startsWith("-")
+  const floorValue = parseCurrency(floor)
+  if (Number.isNaN(floorValue) || floorValue <= 0 || isNegative) {
+    return "$1" // Fallback to safe default for invalid/zero/negative floors
+  }
+  const increment = roundCurrency(floorValue * 0.01)
+  return formatCurrency(increment)
 }
 
 // ─── Auction queries ──────────────────────────────────────────────────────────
@@ -269,7 +287,7 @@ export async function getAuction(id: string): Promise<Auction | null> {
 }
 
 export async function createAuction(
-  input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode">
+  input: Omit<Auction, "id" | "createdAt" | "bidders" | "topBid" | "joinCode"> & { minIncrement?: string; endsAt?: string | null }
 ): Promise<Auction> {
   // Generate a sequential-style ID based on current count
   const count = await prisma.auction.count()
@@ -282,7 +300,8 @@ export async function createAuction(
       title: input.title,
       status: input.status,
       floor: input.floor,
-      endsAt: input.endsAt,
+      endsAt: input.endsAt ?? null,
+      minIncrement: input.minIncrement ?? calculateDefaultMinIncrement(input.floor),
       createdAt: now(),
       terms: input.terms,
       channels: JSON.stringify(input.channels),
@@ -389,24 +408,59 @@ export async function joinAuctionByCode(
 
 export type BidResult =
   | { ok: true; auction: Auction; bidder: Bidder; outbid: Bidder | null }
-  | { ok: false; reason: "not_found" | "auction_closed" | "invalid_amount" | "below_floor" | "below_top_bid" }
+  | { ok: false; reason: "not_found" | "auction_closed" | "invalid_amount" | "below_floor" | "below_top_bid" | "below_min_increment"; detail?: { floor?: string; topBid?: string; minIncrement?: string; minRequired?: string } }
 
 export async function placeBid(auctionId: string, bidderId: string, rawAmount: string): Promise<BidResult> {
   const auctionRow = await prisma.auction.findUnique({ where: { id: auctionId } })
   if (!auctionRow) return { ok: false, reason: "not_found" }
   if (auctionRow.status === "closed") return { ok: false, reason: "auction_closed" }
 
+  // Lazy time-based auto-close check (skip if endsAt is null = unlimited auction)
+  if (auctionRow.endsAt) {
+    const endTime = Date.parse(auctionRow.endsAt)
+    if (!Number.isNaN(endTime) && Date.now() >= endTime) {
+      // Auto-close the auction
+      await prisma.auction.update({ where: { id: auctionId }, data: { status: "closed" } })
+      return { ok: false, reason: "auction_closed" }
+    }
+  }
+
   const bidderRow = await prisma.bidder.findFirst({ where: { id: bidderId, auctionId } })
   if (!bidderRow) return { ok: false, reason: "not_found" }
 
-  const amount = parseCurrency(rawAmount)
+  const amount = roundCurrency(parseCurrency(rawAmount))
   if (Number.isNaN(amount)) return { ok: false, reason: "invalid_amount" }
 
   const floor = parseCurrency(auctionRow.floor)
   const topBid = parseCurrency(auctionRow.topBid)
+  const minIncrement = parseCurrency(auctionRow.minIncrement)
 
-  if (!Number.isNaN(floor) && amount < floor) return { ok: false, reason: "below_floor" }
-  if (!Number.isNaN(topBid) && topBid > 0 && amount <= topBid) return { ok: false, reason: "below_top_bid" }
+  if (!Number.isNaN(floor) && amount < floor) {
+    return { ok: false, reason: "below_floor", detail: { floor: auctionRow.floor } }
+  }
+
+  // Increment-aware bid validation
+  if (!Number.isNaN(topBid) && topBid > 0) {
+    const minRequired = roundCurrency(topBid + minIncrement)
+    console.log(`DEBUG VALIDATION: topBid=${topBid}, minIncrement=${minIncrement}, minRequired=${minRequired}, amount=${amount}`)
+    if (amount <= topBid) {
+      console.log(`DEBUG REJECT: amount <= topBid`)
+      return { 
+        ok: false, 
+        reason: "below_top_bid", 
+        detail: { topBid: auctionRow.topBid, minIncrement: auctionRow.minIncrement, minRequired: formatCurrency(minRequired) } 
+      }
+    }
+    if (amount < minRequired) {
+      console.log(`DEBUG REJECT: amount < minRequired`)
+      return { 
+        ok: false, 
+        reason: "below_min_increment", 
+        detail: { topBid: auctionRow.topBid, minIncrement: auctionRow.minIncrement, minRequired: formatCurrency(minRequired) } 
+      }
+    }
+    console.log(`DEBUG ACCEPT: amount >= minRequired`)
+  }
 
   // Find the outbid leader (different bidder who had the previous top bid)
   let outbid: Bidder | null = null

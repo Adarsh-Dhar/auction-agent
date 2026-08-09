@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { POST as postBid } from "@/app/api/auctions/[auctionId]/bid/route"
-import { createTestAuction, createTestBidder, makeRequest, json } from "@/tests/helpers"
+import { createTestAuction, createTestBidder, makeRequest, json, calculateTestMinIncrement } from "@/tests/helpers"
 
 const AUC = "AUC-BID-DIRECT"
 const AUC_LLM = "AUC-BID-LLM"
@@ -35,7 +35,7 @@ describe("POST /api/auctions/:auctionId/bid — direct numeric bid", () => {
     const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC }) })
     expect(res.status).toBe(200)
     const data = await json<{ auction: { topBid: string } }>(res)
-    expect(data.auction.topBid).toBe("$150")
+    expect(data.auction.topBid).toBe("$150.00")
   })
 
   it("rejects a bid below the floor", async () => {
@@ -83,6 +83,76 @@ describe("POST /api/auctions/:auctionId/bid — direct numeric bid", () => {
     const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC }) })
     expect(res.status).toBe(400)
   })
+
+  it("rejects a bid that beats top bid but not by the minimum increment", async () => {
+    await createTestAuction({ id: "AUC-INC-B", floor: "$100", topBid: "$1000", minIncrement: "$50", joinCode: "INCB01" })
+    await createTestBidder("AUC-INC-B", { id: "bd-inc-b" })
+    const req = makeRequest("/api/auctions/AUC-INC-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-inc-b", amount: "$1025" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-INC-B" }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/at least \$50/i)
+  })
+
+  it("auto-closes auction when endsAt has passed and rejects bid", async () => {
+    const pastDate = new Date(Date.now() - 86400000).toISOString() // 1 day ago
+    await createTestAuction({ id: "AUC-EXP-B", floor: "$100", topBid: "$500", endsAt: pastDate, joinCode: "EXPB01" })
+    await createTestBidder("AUC-EXP-B", { id: "bd-exp-b" })
+    const req = makeRequest("/api/auctions/AUC-EXP-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-exp-b", amount: "$600" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-EXP-B" }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/closed/i)
+  })
+
+  it("accepts bids on auction with endsAt: null (unlimited auction)", async () => {
+    await createTestAuction({ id: "AUC-UNL-B", floor: "$100", topBid: "$500", endsAt: null, joinCode: "UNLB01" })
+    await createTestBidder("AUC-UNL-B", { id: "bd-unl-b" })
+    const req = makeRequest("/api/auctions/AUC-UNL-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-unl-b", amount: "$600" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-UNL-B" }) })
+    expect(res.status).toBe(200)
+    const data = await json<{ auction: { topBid: string } }>(res)
+    expect(data.auction.topBid).toBe("$600.00")
+  })
+
+  it("rounds fractional bids and validates against increment", async () => {
+    await createTestAuction({ id: "AUC-FRC-B", floor: "$100", topBid: "$1000", minIncrement: "$50", joinCode: "FRCB01" })
+    await createTestBidder("AUC-FRC-B", { id: "bd-frc-b" })
+    const req = makeRequest("/api/auctions/AUC-FRC-B/bid", {
+      method: "POST",
+      body: { bidderId: "bd-frc-b", amount: "1001.00000001" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: "AUC-FRC-B" }) })
+    expect(res.status).toBe(409)
+    const data = await json<{ error: string }>(res)
+    expect(data.error).toMatch(/at least \$50/i)
+  })
+
+})
+
+describe("calculateDefaultMinIncrement helper", () => {
+  it("calculates 1% of floor correctly", () => {
+    expect(calculateTestMinIncrement("$100")).toBe("$1.00")
+    expect(calculateTestMinIncrement("$1,000")).toBe("$10.00")
+    expect(calculateTestMinIncrement("$50")).toBe("$0.50")
+    expect(calculateTestMinIncrement("$1,800")).toBe("$18.00")
+    expect(calculateTestMinIncrement("$25")).toBe("$0.25")
+  })
+
+  it("handles edge cases with fallback to $1", () => {
+    expect(calculateTestMinIncrement("invalid")).toBe("$1")
+    expect(calculateTestMinIncrement("$0")).toBe("$1")
+    expect(calculateTestMinIncrement("-$100")).toBe("$1") // Negative values should also fallback
+  })
 })
 
 describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
@@ -108,7 +178,7 @@ describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
     const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
     expect(res.status).toBe(200)
     const data = await json<{ auction: { topBid: string } }>(res)
-    expect(data.auction.topBid).toBe("$200")
+    expect(data.auction.topBid).toBe("$200.00")
   })
 
   it("returns 202 escalation when classifier decision is escalate", async () => {

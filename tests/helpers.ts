@@ -6,6 +6,23 @@ import { prisma } from "@/lib/db"
 
 export const now = () => new Date().toISOString()
 
+// ─── Calculation helpers ────────────────────────────────────────────────────────
+
+/**
+ * Calculate the default minimum bid increment as 1% of the floor price.
+ * This mirrors the logic in lib/auction-store.ts for testing purposes.
+ */
+export function calculateTestMinIncrement(floor: string): string {
+  const isNegative = floor.trim().startsWith("-")
+  const cleaned = floor.replace(/[^0-9.]/g, "")
+  const floorValue = cleaned ? Number.parseFloat(cleaned) : NaN
+  if (Number.isNaN(floorValue) || floorValue <= 0 || isNegative) {
+    return "$1" // Fallback to safe default for invalid/zero/negative floors
+  }
+  const increment = Math.round(floorValue * 0.01 * 100) / 100
+  return `$${increment.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
 export async function createTestAuction(overrides: Partial<{
@@ -16,6 +33,8 @@ export async function createTestAuction(overrides: Partial<{
   topBid: string
   terms: string
   joinCode: string
+  endsAt: string | null
+  minIncrement: string
 }> = {}) {
   // Generate a unique join code per call to avoid unique-constraint collisions
   // when multiple tests run against the same in-process SQLite connection.
@@ -28,7 +47,8 @@ export async function createTestAuction(overrides: Partial<{
       bidders: 0,
       topBid: overrides.topBid ?? "$0",
       floor: overrides.floor ?? "$100",
-      endsAt: new Date(Date.now() + 86_400_000).toISOString(),
+      endsAt: overrides.endsAt ?? new Date(Date.now() + 86_400_000).toISOString(),
+      minIncrement: overrides.minIncrement ?? "$1", // Keep explicit default for test predictability
       createdAt: now(),
       terms: overrides.terms ?? "Standard test terms.",
       channels: JSON.stringify(["Web chat"]),

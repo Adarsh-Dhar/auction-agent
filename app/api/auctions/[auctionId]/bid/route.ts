@@ -3,12 +3,23 @@ import { placeBid, getAuction, getMessages, getBiddersForAuction, createEscalati
 import { classifyMessage } from "@/lib/agent/classify"
 import { answerQuestion } from "@/lib/agent/answer"
 
-const REASON_MESSAGES: Record<string, string> = {
-  not_found: "Auction or bidder not found.",
-  auction_closed: "This auction is closed and no longer accepting bids.",
-  invalid_amount: "That doesn't look like a valid bid amount.",
-  below_floor: "That bid is below the reserve floor.",
-  below_top_bid: "That bid doesn't beat the current top bid.",
+function getErrorMessage(reason: string, detail?: { floor?: string; topBid?: string; minIncrement?: string; minRequired?: string }): string {
+  switch (reason) {
+    case "not_found":
+      return "Auction or bidder not found."
+    case "auction_closed":
+      return "This auction is closed and no longer accepting bids."
+    case "invalid_amount":
+      return "That doesn't look like a valid bid amount."
+    case "below_floor":
+      return `That bid is below the reserve floor of ${detail?.floor ?? "the minimum"}.`
+    case "below_top_bid":
+      return `That bid doesn't beat the current top bid of ${detail?.topBid ?? "the leading bid"}.`
+    case "below_min_increment":
+      return `Bids must beat the current top bid of ${detail?.topBid ?? "the leading bid"} by at least ${detail?.minIncrement ?? "$1"} — try ${detail?.minRequired ?? "a higher amount"} or higher.`
+    default:
+      return "Bid could not be placed."
+  }
 }
 
 /**
@@ -35,7 +46,7 @@ export async function POST(
   // ── LLM classification path ───────────────────────────────────────────────
   if (body.rawMessage && !body.amount) {
     const auction = await getAuction(auctionId)
-    if (!auction) return NextResponse.json({ error: REASON_MESSAGES.not_found }, { status: 404 })
+    if (!auction) return NextResponse.json({ error: getErrorMessage("not_found") }, { status: 404 })
 
     const history = await getMessages(body.bidderId)
     const classification = await classifyMessage(body.rawMessage, history, auction.terms)
@@ -94,7 +105,7 @@ export async function POST(
 
   if (!result.ok) {
     const status = result.reason === "not_found" ? 404 : 409
-    return NextResponse.json({ error: REASON_MESSAGES[result.reason] }, { status })
+    return NextResponse.json({ error: getErrorMessage(result.reason, result.detail) }, { status })
   }
 
   return NextResponse.json(

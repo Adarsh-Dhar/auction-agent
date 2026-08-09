@@ -22,10 +22,10 @@ async function main() {
   // ── Auctions ──────────────────────────────────────────────────────────────
   await prisma.auction.createMany({
     data: [
-      { id: "AUC-1048", title: "Signed first-edition design book", status: "live", bidders: 3, topBid: "$2,450", floor: "$1,800", endsAt: "2026-08-09T18:30:00.000Z", createdAt: now(), terms: "Winner pays within 48 hours. Shipping included.", channels: JSON.stringify(["Web chat", "Email"]), autoExtend: true, requiresApproval: true, joinCode: "K7P2QX" },
-      { id: "AUC-1047", title: "Studio portrait commission", status: "live", bidders: 0, topBid: "$980", floor: "$750", endsAt: "2026-08-10T13:00:00.000Z", createdAt: now(), terms: "Final deliverables due within 30 days.", channels: JSON.stringify(["Web chat"]), autoExtend: false, requiresApproval: false, joinCode: "R9TZ4M" },
-      { id: "AUC-1046", title: "Rare analog synthesizer", status: "draft", bidders: 0, topBid: "$0", floor: "$1,200", endsAt: "2026-08-14T20:00:00.000Z", createdAt: now(), terms: "Local pickup preferred.", channels: JSON.stringify(["Web chat", "SMS"]), autoExtend: true, requiresApproval: true, joinCode: "8HD3WY" },
-      { id: "AUC-1045", title: "Custom walnut studio desk", status: "closed", bidders: 2, topBid: "$3,200", floor: "$2,000", endsAt: "2026-08-01T12:00:00.000Z", createdAt: now(), terms: "Local delivery only. Buyer assembles.", channels: JSON.stringify(["Web chat"]), autoExtend: false, requiresApproval: false, joinCode: "ZP5XKJ" },
+      { id: "AUC-1048", title: "Signed first-edition design book", status: "live", bidders: 3, topBid: "$2,450", floor: "$1,800", endsAt: "2026-08-09T18:30:00.000Z", minIncrement: "$18.00", createdAt: now(), terms: "Winner pays within 48 hours. Shipping included.", channels: JSON.stringify(["Web chat", "Email"]), autoExtend: true, requiresApproval: true, joinCode: "K7P2QX" },
+      { id: "AUC-1047", title: "Studio portrait commission", status: "live", bidders: 0, topBid: "$980", floor: "$750", endsAt: "2026-08-10T13:00:00.000Z", minIncrement: "$7.50", createdAt: now(), terms: "Final deliverables due within 30 days.", channels: JSON.stringify(["Web chat"]), autoExtend: false, requiresApproval: false, joinCode: "R9TZ4M" },
+      { id: "AUC-1046", title: "Rare analog synthesizer", status: "draft", bidders: 0, topBid: "$0", floor: "$1,200", endsAt: null, minIncrement: "$12.00", createdAt: now(), terms: "Local pickup preferred.", channels: JSON.stringify(["Web chat", "SMS"]), autoExtend: true, requiresApproval: true, joinCode: "8HD3WY" },
+      { id: "AUC-1045", title: "Custom walnut studio desk", status: "closed", bidders: 2, topBid: "$3,200", floor: "$2,000", endsAt: "2026-08-01T12:00:00.000Z", minIncrement: "$20.00", createdAt: now(), terms: "Local delivery only. Buyer assembles.", channels: JSON.stringify(["Web chat"]), autoExtend: false, requiresApproval: false, joinCode: "ZP5XKJ" },
     ],
   })
 

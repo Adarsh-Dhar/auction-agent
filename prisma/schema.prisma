@@ -14,7 +14,8 @@ model Auction {
   bidders          Int         @default(0)
   topBid           String      @default("$0")
   floor            String
-  endsAt           String
+  endsAt           String?
+  minIncrement     String      @default("$1")
   createdAt        String
   terms            String      @default("")
   channels         String      @default("Web chat") // JSON array stored as string
