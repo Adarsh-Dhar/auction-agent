@@ -40,6 +40,18 @@ export async function POST(
     const history = await getMessages(body.bidderId)
     const classification = await classifyMessage(body.rawMessage, history, auction.terms)
 
+    // Genuine informational question — answer it with real auction data
+    // instead of echoing the classifier's internal reasoning back as if it
+    // were a clarifying question. This MUST run before the escalate/clarify
+    // checks below: the classifier maps kind=question to decision=clarify,
+    // so if this check ran after them, it would be unreachable for
+    // questions — they'd always get caught by the clarify branch first.
+    if (classification.kind === "question") {
+      const bidders = await getBiddersForAuction(auctionId)
+      const answer = await answerQuestion(body.rawMessage, auction, bidders)
+      return NextResponse.json({ answered: true, answer, classification }, { status: 200 })
+    }
+
     // Low-confidence or explicit escalation → create escalation, don't place bid
     if (classification.decision === "escalate" || classification.confidence < 0.55) {
       const bidder = await findBidderById(body.bidderId)
@@ -62,16 +74,6 @@ export async function POST(
         { needsClarification: true, question: classification.reasoning, classification },
         { status: 200 }
       )
-    }
-
-    // Genuine informational question — answer it with real auction data
-    // instead of echoing the classifier's internal reasoning back as if it
-    // were a clarifying question. This only runs when decision is NOT escalate/clarify,
-    // since those agent-initiated actions take priority.
-    if (classification.kind === "question") {
-      const bidders = await getBiddersForAuction(auctionId)
-      const answer = await answerQuestion(body.rawMessage, auction, bidders)
-      return NextResponse.json({ answered: true, answer, classification }, { status: 200 })
     }
 
     // If the LLM extracted a bid amount, use it

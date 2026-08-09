@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { POST as postBid } from "@/app/api/auctions/[auctionId]/bid/route"
 import { createTestAuction, createTestBidder, makeRequest, json } from "@/tests/helpers"
 
+const AUC = "AUC-BID-DIRECT"
+const AUC_LLM = "AUC-BID-LLM"
+
 // Mock the classifier so bid tests don't need an OpenAI key.
 vi.mock("@/lib/agent/classify", () => ({
   classifyMessage: vi.fn(),
@@ -10,8 +13,13 @@ vi.mock("@/lib/agent/classify", () => ({
 import { classifyMessage } from "@/lib/agent/classify"
 const mockClassify = vi.mocked(classifyMessage)
 
-const AUC = "AUC-BID-DIRECT"
-const AUC_LLM = "AUC-BID-LLM"
+// Mock the answerQuestion function so tests don't need an LLM API key.
+vi.mock("@/lib/agent/answer", () => ({
+  answerQuestion: vi.fn(),
+}))
+
+import { answerQuestion } from "@/lib/agent/answer"
+const mockAnswerQuestion = vi.mocked(answerQuestion)
 
 describe("POST /api/auctions/:auctionId/bid — direct numeric bid", () => {
   beforeEach(async () => {
@@ -81,6 +89,8 @@ describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
   beforeEach(async () => {
     await createTestAuction({ id: AUC_LLM, floor: "$100", topBid: "$0", joinCode: "LLMBID" })
     await createTestBidder(AUC_LLM, { id: "bd-test-l" })
+    mockClassify.mockClear()
+    mockAnswerQuestion.mockClear()
   })
 
   it("places a bid when classifier returns accept with amount", async () => {
@@ -103,7 +113,7 @@ describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
 
   it("returns 202 escalation when classifier decision is escalate", async () => {
     mockClassify.mockResolvedValueOnce({
-      kind: "question",
+      kind: "bid",
       decision: "escalate",
       confidence: 0.4,
       reasoning: "Could not determine intent.",
@@ -120,7 +130,7 @@ describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
 
   it("returns clarification when classifier decision is clarify", async () => {
     mockClassify.mockResolvedValueOnce({
-      kind: "question",
+      kind: "bid",
       decision: "clarify",
       confidence: 0.7,
       reasoning: "What's the exact amount you'd like to bid?",
@@ -134,6 +144,25 @@ describe("POST /api/auctions/:auctionId/bid — rawMessage LLM path", () => {
     const data = await json<{ needsClarification: boolean; question: string }>(res)
     expect(data.needsClarification).toBe(true)
     expect(data.question).toBeTruthy()
+  })
+
+  it("answers informational questions with real auction data", async () => {
+    mockClassify.mockResolvedValueOnce({
+      kind: "question",
+      decision: "clarify",
+      confidence: 0.8,
+      reasoning: "Bidder is asking for information.",
+    })
+    mockAnswerQuestion.mockResolvedValueOnce("The current top bid is $0.")
+    const req = makeRequest(`/api/auctions/${AUC_LLM}/bid`, {
+      method: "POST",
+      body: { bidderId: "bd-test-l", rawMessage: "what's the top bid?" },
+    })
+    const res = await postBid(req, { params: Promise.resolve({ auctionId: AUC_LLM }) })
+    expect(res.status).toBe(200)
+    const data = await json<{ answered: boolean; answer: string }>(res)
+    expect(data.answered).toBe(true)
+    expect(data.answer).toBe("The current top bid is $0.")
   })
 
   it("escalates when confidence is below 0.55 even if decision is accept", async () => {
