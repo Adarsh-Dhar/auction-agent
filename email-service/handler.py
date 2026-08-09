@@ -2,8 +2,13 @@
 """
 Caspian Email Service for Auction Agent
 Handles incoming emails and routes them to auction actions via the Next.js
-API: joining, placing bids, checking status, and logging questions. Also
-sends a best-effort outbid notification when someone is bid past.
+API: joining, checking status, and — for everything else, including bids —
+handing raw text to the same LLM classifier the web chat channel uses (see
+classify_and_respond_via_api). This keeps bid/question judgment consistent
+across channels instead of relying on a local regex that could silently
+misroute ambiguous or conditional bids. Also sends a best-effort outbid
+notification when someone is bid past, and dispatches escalation-resolution
+notes back to bidders over email.
 """
 
 import os
@@ -35,15 +40,42 @@ EMAIL_CONNECTION_ID = None
 _client: CommClient | None = None
 
 
+def strip_quoted_reply(text: str) -> str:
+    """
+    Cut off quoted history from an email reply so an old bid/question in a
+    thread doesn't get re-matched alongside the new message.
+
+    Stops at the first line that looks like a quote marker ("> ...") or a
+    client-generated "On ... wrote:" header. If neither is found, the text
+    is returned unchanged.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+        if stripped_line.startswith(">"):
+            return "\n".join(lines[:i]).strip()
+        if re.match(r'^On .{0,120} wrote:\s*$', stripped_line):
+            return "\n".join(lines[:i]).strip()
+    return text.strip()
+
+
 def parse_intent(text: str) -> dict:
     """
-    Classify an inbound email body into one of: join, bid, status, question.
+    Route an inbound email body to one of: join, status, or "agent" (bid or
+    question — anything that needs real judgment).
+
+    This function ONLY does cheap, unambiguous routing. It deliberately does
+    NOT try to extract a bid amount via regex anymore — that used to mean a
+    conditional/negated/ambiguous bid sent by email ("I could go to 60 if it
+    ships by Friday") would silently miss the regex and get misrouted as a
+    plain question, bypassing the LLM classifier entirely. Now, anything
+    that isn't clearly a join code or a status check is handed to the LLM
+    classifier via classify_and_respond(), the same as the web chat channel.
 
     Formats recognized:
     - join:   "/join K7P2QX", "join K7P2QX", or a bare 6-char code "K7P2QX"
-    - bid:    "bid 2500", "bid $2,500", or a bare "$2500"
     - status: "status", "update", "how's it going"
-    - anything else falls through to "question"
+    - anything else → "agent" (bid or question; the LLM decides which)
     """
     stripped = text.strip()
     lowered = stripped.lower()
@@ -51,19 +83,18 @@ def parse_intent(text: str) -> dict:
     join_match = re.search(r'\bjoin\s+([a-z0-9]{4,8})\b', lowered)
     if join_match:
         return {"type": "join", "code": join_match.group(1).upper()}
-    if re.fullmatch(r'[a-z0-9]{6}', lowered):
-        return {"type": "join", "code": lowered.upper()}
 
-    bid_match = re.search(r'\bbid\b[^\d]*([\d,]+(?:\.\d+)?)', lowered)
-    if not bid_match:
-        bid_match = re.search(r'\$\s*([\d,]+(?:\.\d+)?)', stripped)
-    if bid_match:
-        return {"type": "bid", "amount": bid_match.group(1)}
-
+    # Check status keywords BEFORE the bare 6-char join-code fallback below —
+    # "status" and "update" are themselves exactly 6 characters, so without
+    # this ordering they'd incorrectly match as a join code (pre-existing
+    # bug, caught by tests/email_service/test_parse_intent.py).
     if lowered.strip("?! ") in ("status", "update", "how's it going", "hows it going"):
         return {"type": "status"}
 
-    return {"type": "question", "text": stripped}
+    if re.fullmatch(r'[a-z0-9]{6}', lowered):
+        return {"type": "join", "code": lowered.upper()}
+
+    return {"type": "agent", "text": stripped}
 
 
 def lookup_bidder_by_email(email: str):
@@ -96,18 +127,47 @@ def join_auction_via_api(code: str, name: str, handle: str, address: str, connec
         return {"error": f"API request failed: {str(e)}"}
 
 
-def place_bid_via_api(auction_id: str, bidder_id: str, amount: str) -> dict:
+def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: str) -> dict:
+    """
+    Send the bidder's raw text to the SAME LLM classification path the web
+    chat channel uses — POST /api/auctions/:auctionId/bid with `rawMessage` 
+    and no `amount`. This is deliberate: sending a pre-extracted amount
+    (the old behaviour) skips classify.ts entirely, so conditional bids,
+    negation, and ambiguous phrasing never got judged, they just silently
+    misfired. Passing raw text keeps email and web chat at parity.
+
+    Returns the raw JSON body plus an HTTP status-derived `outcome` field:
+      - "placed"        → 200, no needsEscalation/needsClarification flags, bid went through
+      - "escalated"      → 202, classification.decision was "escalate" or low-confidence
+      - "clarify"        → 200, classification.decision was "clarify"
+      - "not_a_bid"      → 200, classification ran but this wasn't a bid (log as question)
+      - "error"          → request failed or non-2xx status
+    """
     try:
         response = requests.post(
             f"{NEXTJS_API_URL}/api/auctions/{auction_id}/bid",
-            json={"bidderId": bidder_id, "amount": amount},
-            timeout=10,
+            json={"bidderId": bidder_id, "rawMessage": raw_message},
+            timeout=15,
         )
-        if response.status_code == 200:
-            return response.json()
-        return {"error": response.json().get("error", "Failed to place bid")}
     except Exception as e:
-        return {"error": f"API request failed: {str(e)}"}
+        return {"outcome": "error", "error": f"API request failed: {str(e)}"}
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+
+    if response.status_code == 202 and body.get("needsEscalation"):
+        return {**body, "outcome": "escalated"}
+    if response.status_code == 200 and body.get("needsClarification"):
+        return {**body, "outcome": "clarify"}
+    if response.status_code == 200 and "classification" in body and "auction" not in body:
+        # Classifier ran but didn't produce a placed bid (e.g. kind != "bid")
+        return {**body, "outcome": "not_a_bid"}
+    if response.status_code == 200 and "auction" in body:
+        return {**body, "outcome": "placed"}
+
+    return {**body, "outcome": "error", "error": body.get("error", "Failed to process message")}
 
 
 def get_auction_status(auction_id: str):
@@ -122,6 +182,13 @@ def get_auction_status(auction_id: str):
 
 
 def post_question_via_api(bidder_id: str, text: str) -> dict:
+    """
+    Log plain text to the bidder's message thread with no classification.
+    Used only as a last-resort fallback if classify_and_respond_via_api()
+    itself fails to reach the API (outcome == "error") — NOT used for normal
+    question routing anymore, since classify_and_respond_via_api() already
+    runs everything through the LLM classifier first.
+    """
     try:
         response = requests.post(
             f"{NEXTJS_API_URL}/api/bidders/{bidder_id}",
@@ -219,13 +286,16 @@ def notify_escalation_resolved(client: CommClient, bidder_id: str, note: str):
 
 def handle_message(message, client: CommClient):
     """
-    Handle incoming email messages: join / bid / status / question.
+    Handle incoming email messages: join / status / agent (bid or question).
+
+    Quoted reply history is stripped first so an old bid/question further
+    down a thread doesn't get re-classified alongside the new message.
     """
     sender = message.sender
     if isinstance(sender, dict):
         sender = sender.get('address', 'unknown@example.com')
 
-    text = message.text
+    text = strip_quoted_reply(message.text)
     conversation_id = message.conversation_id
 
     print(f"[{conversation_id}] Received email from {sender}: {text[:100]}...")
@@ -266,23 +336,6 @@ def handle_message(message, client: CommClient):
     auction = found["auction"]
     bidder = found["bidder"]
 
-    if intent["type"] == "bid":
-        result = place_bid_via_api(auction["id"], bidder["id"], intent["amount"])
-        if "error" in result:
-            reply = f"Bid not accepted: {result['error']}"
-        else:
-            new_auction = result.get("auction", {})
-            reply = (
-                f"✅ Bid accepted at {new_auction.get('topBid')} on \"{new_auction.get('title')}\".\n"
-                f"You're currently in the lead."
-            )
-            outbid = result.get("outbid")
-            if outbid:
-                notify_outbid(client, outbid, new_auction.get("title", "the auction"), new_auction.get("topBid", ""))
-        message.reply(reply)
-        print(f"[{conversation_id}] Handled bid")
-        return
-
     if intent["type"] == "status":
         status = get_auction_status(auction["id"])
         if not status:
@@ -301,15 +354,70 @@ def handle_message(message, client: CommClient):
         print(f"[{conversation_id}] Handled status")
         return
 
-    # Fallback: log it as a question for the operator to see in the dashboard.
+    # Everything else (a bid in any phrasing, a genuine question, an
+    # ambiguous/conditional message) goes through the SAME LLM classifier
+    # the web chat channel uses. This is what item #1 in the audit fixed:
+    # previously a regex tried to extract a bid amount here, so anything
+    # phrased outside its pattern ("I could go to 60 if it ships by Friday")
+    # silently fell through to "question" and never got real judgment.
+    assert intent["type"] == "agent"
+    result = classify_and_respond_via_api(auction["id"], bidder["id"], text)
+    outcome = result.get("outcome")
+
+    if outcome == "placed":
+        new_auction = result.get("auction", {})
+        reply = (
+            f"✅ Bid accepted at {new_auction.get('topBid')} on \"{new_auction.get('title')}\".\n"
+            f"You're currently in the lead."
+        )
+        outbid = result.get("outbid")
+        if outbid:
+            notify_outbid(client, outbid, new_auction.get("title", "the auction"), new_auction.get("topBid", ""))
+        message.reply(reply)
+        print(f"[{conversation_id}] Handled bid (classified)")
+        return
+
+    if outcome == "escalated":
+        reply = (
+            "Thanks — that one needs a human to weigh in. I've flagged it for "
+            "the auction team and they'll follow up shortly.\n\n"
+            f"Current top bid on \"{auction['title']}\" is {auction['topBid']}."
+        )
+        message.reply(reply)
+        print(f"[{conversation_id}] Handled bid (escalated)")
+        return
+
+    if outcome == "clarify":
+        question = result.get("question") or "Could you clarify your offer?"
+        message.reply(question)
+        print(f"[{conversation_id}] Handled bid (needs clarification)")
+        return
+
+    if outcome == "not_a_bid":
+        # Classifier ran and determined this wasn't a bid attempt — log it
+        # as a question for the operator, same as before, but now it's a
+        # judgment call made by the LLM rather than "didn't match a regex."
+        post_question_via_api(bidder["id"], text)
+        reply = (
+            "Got your question — I've logged it for the auction team.\n\n"
+            f"Current top bid on \"{auction['title']}\" is {auction['topBid']}. "
+            "Reply any time to jump back in."
+        )
+        message.reply(reply)
+        print(f"[{conversation_id}] Handled question (classified)")
+        return
+
+    # outcome == "error" — the classify/bid API call itself failed (network,
+    # 5xx, etc). Fall back to logging the raw text so nothing is silently
+    # dropped, and let the bidder know something went wrong rather than
+    # pretending it worked.
     post_question_via_api(bidder["id"], text)
-    reply = (
-        "Got your question — I've logged it for the auction team.\n\n"
-        f"Current top bid on \"{auction['title']}\" is {auction['topBid']}. "
-        "Reply with \"bid <amount>\" any time to jump back in."
+    message.reply(
+        "Sorry, something went wrong processing that on our end. "
+        "I've logged your message and the auction team will follow up — "
+        "feel free to resend in a few minutes too."
     )
-    message.reply(reply)
-    print(f"[{conversation_id}] Handled question")
+    print(f"[{conversation_id}] Error handling message: {result.get('error')}")
 
 
 # ─── Internal webhook server ──────────────────────────────────────────────────
@@ -360,8 +468,11 @@ def main():
     print(f"Mailbox: {CASPIAN_MAILBOX}")
     print(f"Next.js API: {NEXTJS_API_URL}")
 
-    # Initialize Caspian client
-    client = CommClient()
+    # Initialize Caspian client. CommClient() actually reads CASPIAN_BASE_URL
+    # from the environment internally if base_url isn't passed, so this was
+    # never truly "dead" — but passing it explicitly here makes that
+    # relationship visible instead of relying on undocumented SDK behavior.
+    client = CommClient(api_key=CASPIAN_API_KEY, base_url=CASPIAN_BASE_URL)
 
     # Connect to email
     print("Connecting to email service...")

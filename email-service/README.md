@@ -170,6 +170,16 @@ def parse_join_command(text: str) -> dict:
 
 Modify the `handle_message()` function to customize reply formatting.
 
+## Known Limitations
+
+- **Sender identity is trusted as-is.** `handle_message` treats whatever
+  address Caspian reports as `message.sender` as that bidder's verified
+  identity — there's no SPF/DKIM check or Caspian-side auth step on top of
+  it. Fine for an MVP/demo; anyone who can send mail as a given address can
+  act as that bidder. Proper verification is out of scope for now and would
+  need to happen either in Caspian itself or as an added check here before
+  production use with real money.
+
 ## Production Deployment
 
 For production:
@@ -179,6 +189,7 @@ For production:
 3. Use environment-specific configuration
 4. Add logging and monitoring
 5. Implement error handling and retry logic
+6. Address sender identity verification (see Known Limitations above)
 
 ## License
 
