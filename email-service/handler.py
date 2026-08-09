@@ -209,6 +209,8 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
       - "escalated"      → 202, classification.decision was "escalate" or low-confidence
       - "clarify"        → 200, classification.decision was "clarify"
       - "not_a_bid"      → 200, classification ran but this wasn't a bid (log as question)
+      - "answered"       → 200, classification.kind was "question" and agent answered with real data
+      - "rejected"       → 409, bid was rejected for business reasons (below floor, below top bid, etc.)
       - "error"          → request failed (after retry) or non-2xx status
     """
     try:
@@ -225,6 +227,12 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
     except Exception:
         body = {}
 
+    if response.status_code == 200 and body.get("answered"):
+        # Genuine question — the API already generated a real answer using
+        # live auction data (see lib/agent/answer.ts). Must be checked before
+        # the not_a_bid fallback below, since this response shape also lacks
+        # an "auction" key.
+        return {**body, "outcome": "answered"}
     if response.status_code == 202 and body.get("needsEscalation"):
         return {**body, "outcome": "escalated"}
     if response.status_code == 200 and body.get("needsClarification"):
@@ -234,6 +242,10 @@ def classify_and_respond_via_api(auction_id: str, bidder_id: str, raw_message: s
         return {**body, "outcome": "not_a_bid"}
     if response.status_code == 200 and "auction" in body:
         return {**body, "outcome": "placed"}
+    if response.status_code == 409 and body.get("error"):
+        # A real business rejection (below floor, below top bid, closed
+        # auction) — not a system failure. Give the bidder the actual reason.
+        return {**body, "outcome": "rejected"}
 
     return {**body, "outcome": "error", "error": body.get("error", "Failed to process message")}
 
@@ -456,6 +468,22 @@ def handle_message(message, client: CommClient):
             notify_outbid(client, outbid, new_auction.get("title", "the auction"), new_auction.get("topBid", ""))
         message.reply(reply)
         print(f"[{conversation_id}] Handled bid (classified)")
+        return
+
+    if outcome == "answered":
+        reply = result.get("answer") or "Here's what I have on the auction — let me know if you need more detail."
+        message.reply(reply)
+        print(f"[{conversation_id}] Handled question (answered)")
+        return
+
+    if outcome == "rejected":
+        reply = (
+            f"{result.get('error', 'That offer could not be accepted.')}\n\n"
+            f"Current top bid on \"{auction['title']}\" is {auction['topBid']}. "
+            "Feel free to send a higher offer."
+        )
+        message.reply(reply)
+        print(f"[{conversation_id}] Handled bid (rejected: {result.get('error')})")
         return
 
     if outcome == "escalated":

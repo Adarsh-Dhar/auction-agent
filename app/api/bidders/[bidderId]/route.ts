@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
-import { findBidderById, getMessages, addMessage, addAgentMessage, emit } from "@/lib/auction-store"
+import { findBidderById, getMessages, addMessage, addAgentMessage, emit, getAuction, getBiddersForAuction } from "@/lib/auction-store"
 import { classifyMessage } from "@/lib/agent/classify"
+import { answerQuestion } from "@/lib/agent/answer"
 import { getConversationContext } from "@/lib/agent/memory"
 import { prisma } from "@/lib/db"
 
@@ -81,8 +82,19 @@ export async function POST(
   // Fire SSE so mission control sees it immediately
   emit("message.created", { ...stored, classification })
 
-  // Auto-reply for clarification requests
-  if (classification.decision === "clarify") {
+  // Genuine informational question — answer it with real auction data
+  // instead of echoing the classifier's internal reasoning back as if it
+  // were a clarifying question aimed at the bidder.
+  if (classification.kind === "question") {
+    const auction = await getAuction(bidderRow.auctionId)
+    if (auction) {
+      const bidders = await getBiddersForAuction(bidderRow.auctionId)
+      const answer = await answerQuestion(messageText, auction, bidders)
+      await addAgentMessage(bidderId, answer, "system")
+    }
+  } else if (classification.decision === "clarify") {
+    // Auto-reply for genuine clarification requests (e.g. a relative bid
+    // with no concrete number — the agent needs the bidder to say more).
     await addAgentMessage(
       bidderId,
       classification.reasoning || "Could you clarify — I want to make sure I record your intent correctly.",

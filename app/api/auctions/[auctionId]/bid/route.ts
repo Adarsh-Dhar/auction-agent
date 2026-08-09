@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
-import { placeBid, getAuction, getMessages, createEscalation, findBidderById } from "@/lib/auction-store"
+import { placeBid, getAuction, getMessages, getBiddersForAuction, createEscalation, findBidderById } from "@/lib/auction-store"
 import { classifyMessage } from "@/lib/agent/classify"
+import { answerQuestion } from "@/lib/agent/answer"
 
 const REASON_MESSAGES: Record<string, string> = {
   not_found: "Auction or bidder not found.",
@@ -61,6 +62,16 @@ export async function POST(
         { needsClarification: true, question: classification.reasoning, classification },
         { status: 200 }
       )
+    }
+
+    // Genuine informational question — answer it with real auction data
+    // instead of echoing the classifier's internal reasoning back as if it
+    // were a clarifying question. This only runs when decision is NOT escalate/clarify,
+    // since those agent-initiated actions take priority.
+    if (classification.kind === "question") {
+      const bidders = await getBiddersForAuction(auctionId)
+      const answer = await answerQuestion(body.rawMessage, auction, bidders)
+      return NextResponse.json({ answered: true, answer, classification }, { status: 200 })
     }
 
     // If the LLM extracted a bid amount, use it
